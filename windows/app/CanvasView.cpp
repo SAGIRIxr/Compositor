@@ -9,6 +9,7 @@
 #include <cmath>
 #include <iterator>
 #include <cstdlib>
+#include "compositor/uuid.h"
 
 using namespace comp;
 
@@ -244,6 +245,75 @@ void CanvasView::paintEvent(QPaintEvent*) {
             painter.drawLine(hover_ - QPointF(0, 5), hover_ + QPointF(0, 5));
         }
     }
+    drawRulers(painter);
+}
+
+bool CanvasView::inRuler(QPointF p) const {
+    return showRulers_ && (p.x() < kRuler || p.y() < kRuler);
+}
+
+int CanvasView::hitGuide(QPointF p) const {
+    if (!showGuides_) return -1;
+    const auto& guides = session_->doc().guides;
+    for (int i = int(guides.size()) - 1; i >= 0; --i) {
+        const Guide& g = guides[size_t(i)];
+        double at = g.horizontal ? toWidget(QPointF(0, g.position)).y() : toWidget(QPointF(g.position, 0)).x();
+        if (std::abs((g.horizontal ? p.y() : p.x()) - at) <= 4) return i;
+    }
+    return -1;
+}
+
+void CanvasView::drawRulers(QPainter& painter) {
+    if (!showRulers_) return;
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    QColor band(56, 56, 58), tick(170, 170, 170);
+    painter.fillRect(QRect(0, 0, width(), kRuler), band);
+    painter.fillRect(QRect(0, 0, kRuler, height()), band);
+    // 主刻度间距：至少 60 屏幕像素，取 1、2、5 × 10ⁿ。
+    double step = 1;
+    for (double base = 1; ; base *= 10) {
+        double candidates[3] = {base, base * 2, base * 5};
+        bool found = false;
+        for (double c : candidates) if (c * zoom_ >= 60) { step = c; found = true; break; }
+        if (found || base > 1e6) break;
+    }
+    double minor = step / 10;
+    if (minor * zoom_ < 5) minor = step / 5;
+    if (minor * zoom_ < 5) minor = step / 2;
+    QFont font = painter.font();
+    font.setPixelSize(9);
+    painter.setFont(font);
+    painter.setPen(tick);
+    QPointF a = toDocument(QPointF(kRuler, kRuler)), b = toDocument(QPointF(width(), height()));
+    for (double v = std::floor(a.x() / minor) * minor; v <= b.x(); v += minor) {
+        double x = toWidget(QPointF(v, 0)).x();
+        if (x < kRuler) continue;
+        bool major = std::abs(std::remainder(v, step)) < minor / 2;
+        painter.drawLine(QPointF(x, kRuler), QPointF(x, kRuler - (major ? kRuler - 2 : 4)));
+        if (major) painter.drawText(QPointF(x + 2, 9), QString::number(v, 'g', 6));
+    }
+    for (double v = std::floor(a.y() / minor) * minor; v <= b.y(); v += minor) {
+        double y = toWidget(QPointF(0, v)).y();
+        if (y < kRuler) continue;
+        bool major = std::abs(std::remainder(v, step)) < minor / 2;
+        painter.drawLine(QPointF(kRuler, y), QPointF(kRuler - (major ? kRuler - 2 : 4), y));
+        if (major) {
+            painter.save();
+            painter.translate(9, y + 2);
+            painter.rotate(-90);
+            painter.drawText(QPointF(-QFontMetrics(font).horizontalAdvance(QString::number(v, 'g', 6)), 0), QString::number(v, 'g', 6));
+            painter.restore();
+        }
+    }
+    // 鼠标位置的指示线。
+    if (hover_.x() >= 0) {
+        painter.setPen(QColor(0, 200, 255));
+        painter.drawLine(QPointF(hover_.x(), 0), QPointF(hover_.x(), kRuler));
+        painter.drawLine(QPointF(0, hover_.y()), QPointF(kRuler, hover_.y()));
+    }
+    painter.fillRect(QRect(0, 0, kRuler, kRuler), band);
+    painter.restore();
 }
 
 Tool CanvasView::effectiveTool() const {
@@ -293,6 +363,13 @@ void CanvasView::updateCursor(QPointF p) {
     case Tool::Wand: setCursor(Qt::CrossCursor); return;
     case Tool::Zoom: setCursor(Qt::PointingHandCursor); return;
     case Tool::Move: {
+        if (drag_ == DragMode::Guide || (drag_ == DragMode::None && hitGuide(p) >= 0)) {
+            int g = drag_ == DragMode::Guide ? guideIndex_ : hitGuide(p);
+            const auto& guides = session_->doc().guides;
+            bool horizontal = g >= 0 && g < int(guides.size()) && guides[size_t(g)].horizontal;
+            setCursor(horizontal ? Qt::SplitVCursor : Qt::SplitHCursor);
+            return;
+        }
         int hit = drag_ == DragMode::None ? hitTransform(p) : handle_;
         if (drag_ == DragMode::Rotate || hit == 8) setCursor(Qt::CrossCursor);
         else if (hit >= 0 && hit < 8) setCursor(hit % 4 == 0 ? Qt::SizeFDiagCursor : hit % 4 == 2 ? Qt::SizeBDiagCursor
@@ -419,6 +496,30 @@ void CanvasView::mousePressEvent(QMouseEvent* event) {
     }
     if (event->button() != Qt::LeftButton) return;
     Document& doc = session_->doc();
+    // 从标尺拖出参考线；移动工具下可以拖动已有的参考线。
+    if (inRuler(p) && !(p.x() < kRuler && p.y() < kRuler)) {
+        if (doc.guides.size() >= 1000) { emit statusMessage(QStringLiteral("参考线最多 1000 条。")); return; }
+        session_->checkpoint(QStringLiteral("新建参考线"));
+        Guide guide;
+        guide.id = makeUUID();
+        guide.horizontal = p.y() < kRuler;
+        guide.position = guide.horizontal ? std::round(d.y()) : std::round(d.x());
+        doc.guides.push_back(guide);
+        guideIndex_ = int(doc.guides.size()) - 1;
+        drag_ = DragMode::Guide;
+        showGuides_ = true;
+        update();
+        return;
+    }
+    if (effectiveTool() == Tool::Move) {
+        int hit = hitGuide(p);
+        if (hit >= 0) {
+            session_->checkpoint(QStringLiteral("移动参考线"));
+            guideIndex_ = hit;
+            drag_ = DragMode::Guide;
+            return;
+        }
+    }
     switch (effectiveTool()) {
     case Tool::Zoom:
         setZoom(event->modifiers() & Qt::AltModifier ? zoom_ / 2 : zoom_ * 2, p);
@@ -626,12 +727,26 @@ void CanvasView::mouseMoveEvent(QMouseEvent* event) {
         updateGradient(d, event->modifiers());
         update();
         break;
+    case DragMode::Guide: {
+        auto& guides = session_->doc().guides;
+        if (guideIndex_ >= 0 && guideIndex_ < int(guides.size())) {
+            Guide& g = guides[size_t(guideIndex_)];
+            g.position = std::clamp(g.horizontal ? std::round(d.y()) : std::round(d.x()), -1000000.0, 1000000.0);
+            emit statusMessage(QStringLiteral("%1参考线：%2 像素").arg(g.horizontal ? QStringLiteral("水平") : QStringLiteral("垂直")).arg(g.position));
+        }
+        update();
+        break;
+    }
     case DragMode::Lasso:
         if (lassoPoints_.empty() || QLineF(toWidget(lassoPoints_.back()), p).length() >= 1.5) lassoPoints_.push_back(d);
         update();
         break;
     case DragMode::None:
         if (polygonActive_) update();
+        if (showRulers_) {
+            update(QRect(0, 0, width(), kRuler));
+            update(QRect(0, 0, kRuler, height()));
+        }
         if (effectiveTool() == Tool::Move) updateCursor(p);
         if (effectiveTool() == Tool::Clone && tools_->cloneSource) update();
         else if (effectiveTool() == Tool::Brush || effectiveTool() == Tool::Eraser || effectiveTool() == Tool::Heal) {
@@ -670,6 +785,19 @@ void CanvasView::mouseReleaseEvent(QMouseEvent* event) {
             commitSelection(polygonSelection(doc.width, doc.height, points), selectMode_, QStringLiteral("套索"));
         }
         lassoPoints_.clear();
+        update();
+        return;
+    }
+    if (drag_ == DragMode::Guide) {
+        drag_ = DragMode::None;
+        // 拖回标尺或拖出画布控件：删除这条参考线。
+        QPointF p = event->position();
+        auto& guides = session_->doc().guides;
+        if ((inRuler(p) || !rect().contains(p.toPoint())) && guideIndex_ >= 0 && guideIndex_ < int(guides.size())) {
+            guides.erase(guides.begin() + guideIndex_);
+        }
+        guideIndex_ = -1;
+        session_->notifyChanged(false);
         update();
         return;
     }

@@ -12,6 +12,7 @@
 #include "compositor/project_io.h"
 #include "compositor/renderer.h"
 #include "compositor/selection.h"
+#include "compositor/uuid.h"
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
@@ -224,6 +225,35 @@ void MainWindow::createActions() {
     });
     guides->setCheckable(true);
     guides->setChecked(true);
+    auto* rulers = add("rulers", QStringLiteral("显示标尺"), QKeySequence(QStringLiteral("Ctrl+R")), [this](bool on) {
+        for (int i = 0; i < tabs_->count(); ++i) if (auto* c = qobject_cast<CanvasView*>(tabs_->widget(i))) c->setShowRulers(on);
+    });
+    rulers->setCheckable(true);
+    rulers->setChecked(true);
+    add("newGuide", QStringLiteral("新建参考线…"), QKeySequence(), [this] {
+        Session* s = currentSession();
+        if (!s) return;
+        bool ok = false;
+        QString direction = QInputDialog::getItem(this, QStringLiteral("新建参考线"), QStringLiteral("方向："),
+            {QStringLiteral("水平"), QStringLiteral("垂直")}, 0, false, &ok);
+        if (!ok) return;
+        bool horizontal = direction == QStringLiteral("水平");
+        double position = QInputDialog::getDouble(this, QStringLiteral("新建参考线"), QStringLiteral("位置（像素）："),
+            (horizontal ? s->doc().height : s->doc().width) / 2.0, -1000000, 1000000, 1, &ok);
+        if (!ok) return;
+        editCurrent(QStringLiteral("新建参考线"), [&](Document& d) {
+            if (d.guides.size() >= 1000) return;
+            Guide g;
+            g.id = makeUUID();
+            g.horizontal = horizontal;
+            g.position = position;
+            d.guides.push_back(g);
+        });
+    });
+    add("clearGuides", QStringLiteral("清除参考线"), QKeySequence(), [this] {
+        Session* s = currentSession();
+        if (s && !s->doc().guides.empty()) editCurrent(QStringLiteral("清除参考线"), [](Document& d) { d.guides.clear(); });
+    });
     auto* grid = add("pixelGrid", QStringLiteral("显示像素网格"), QKeySequence(), [this](bool on) {
         for (int i = 0; i < tabs_->count(); ++i) if (auto* c = qobject_cast<CanvasView*>(tabs_->widget(i))) c->setShowPixelGrid(on);
     });
@@ -349,7 +379,10 @@ void MainWindow::createMenus() {
     view->addAction(actions_["fit"]);
     view->addAction(actions_["actual"]);
     view->addSeparator();
+    view->addAction(actions_["rulers"]);
     view->addAction(actions_["guides"]);
+    view->addAction(actions_["newGuide"]);
+    view->addAction(actions_["clearGuides"]);
     view->addAction(actions_["pixelGrid"]);
 
     QMenu* help = menuBar()->addMenu(QStringLiteral("帮助(&H)"));
@@ -534,6 +567,7 @@ void MainWindow::addSession(Session* session) {
     session->setParent(canvas);
     canvas->setShowGuides(actions_["guides"]->isChecked());
     canvas->setShowPixelGrid(actions_["pixelGrid"]->isChecked());
+    canvas->setShowRulers(actions_["rulers"]->isChecked());
     int index = tabs_->addTab(canvas, session->title());
     tabs_->setTabToolTip(index, session->path());
     tabs_->setCurrentIndex(index);
@@ -611,7 +645,8 @@ void MainWindow::updateActions() {
     adjustmentMenu_->setEnabled(has);
     bool selection = s && s->doc().selection;
     for (const char* key : {"deselect", "feather", "expand", "contract", "crop", "contentFill", "clear", "cut"}) actions_[key]->setEnabled(selection);
-    for (const char* key : {"selectAll", "inverse"}) actions_[key]->setEnabled(has);
+    for (const char* key : {"selectAll", "inverse", "newGuide"}) actions_[key]->setEnabled(has);
+    actions_["clearGuides"]->setEnabled(s && !s->doc().guides.empty());
     actions_["loadSelection"]->setEnabled(pixel);
     if (selection) actions_["copy"]->setEnabled(true);
     actions_["undo"]->setEnabled(s && s->canUndo());

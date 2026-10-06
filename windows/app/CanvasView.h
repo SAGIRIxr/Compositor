@@ -32,6 +32,7 @@ public:
     QPointF toWidget(QPointF documentPoint) const;
     void setShowGuides(bool show) { showGuides_ = show; update(); }
     void setShowPixelGrid(bool show) { showPixelGrid_ = show; update(); }
+    void setShowRulers(bool show) { showRulers_ = show; update(); }
     // 多边形套索：取消正在画的多边形；闭合并生成选区。
     void cancelPolygon();
     bool closePolygon();
@@ -57,7 +58,7 @@ protected:
     void leaveEvent(QEvent*) override;
 
 private:
-    enum class DragMode { None, Pan, Paint, Move, Resize, Rotate, Marquee, Lasso, Gradient };
+    enum class DragMode { None, Pan, Paint, Move, Resize, Rotate, Marquee, Lasso, Gradient, Guide };
     void invalidate();
     void renderAll();
     void renderRegion(const QRectF& documentRect);
@@ -104,6 +105,13 @@ private:
     comp::MaskRef gradientMask_;
     bool gradientOnMask_ = false;
     void updateGradient(QPointF documentPoint, Qt::KeyboardModifiers modifiers);
+    // 标尺与参考线
+    static constexpr int kRuler = 18;
+    bool showRulers_ = true;
+    int guideIndex_ = -1;
+    void drawRulers(QPainter& painter);
+    int hitGuide(QPointF widgetPoint) const;
+    bool inRuler(QPointF widgetPoint) const;
     // 选区工具的进行状态
     comp::SelectionMode selectMode_ = comp::SelectionMode::Replace;
     Qt::KeyboardModifiers pressModifiers_;

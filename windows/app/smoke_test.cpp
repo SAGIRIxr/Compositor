@@ -193,6 +193,18 @@ int main(int argc, char** argv) {
     EXPECT(std::abs(session->doc().find(gradientLayer)->image->at(200, 200)[0] - expected) < 40);
     action(window, QStringLiteral("delete"))->trigger();
 
+    // 参考线：从顶部标尺拖出一条水平参考线，用移动工具挪动，再拖回标尺删除。
+    action(window, QStringLiteral("tool_V"))->trigger();
+    drag(canvas, QPoint(canvas->width() / 2, 5), canvas->toWidget(QPointF(200, 100)).toPoint());
+    EXPECT(session->doc().guides.size() == 1 && session->doc().guides[0].horizontal
+           && std::abs(session->doc().guides[0].position - 100) <= 1);
+    drag(canvas, canvas->toWidget(QPointF(300, 100)).toPoint(), canvas->toWidget(QPointF(300, 150)).toPoint());
+    EXPECT(session->doc().guides.size() == 1 && std::abs(session->doc().guides[0].position - 150) <= 1);
+    drag(canvas, canvas->toWidget(QPointF(300, 150)).toPoint(), QPoint(canvas->width() / 2, 5));
+    EXPECT(session->doc().guides.empty());
+    action(window, QStringLiteral("undo"))->trigger();
+    EXPECT(session->doc().guides.size() == 1);
+
     // 反相调整层（无参数，不弹编辑框）。
     action(window, QStringLiteral("adjust_Invert"))->trigger();
     EXPECT(session->doc().layers.size() == 3);
