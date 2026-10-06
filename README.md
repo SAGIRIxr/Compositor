@@ -1,5 +1,7 @@
 # Compositor
 
+> **Windows 版**：本仓库新增了用 C++ 与 Qt 6 重写的 Windows 版本，项目文件与 macOS 版通用。下载、功能与构建方法见 [windows/README.md](windows/README.md)。
+
 Adobe Photoshop costs too much and tools like GIMP don’t feel familiar enough for me to stay in flow. That’s why I built Compositor.
 
 The goal was to create a full-featured image editor that is completely free and open source. I used to use Photoshop for compositing and post-processing, so Compositor is built around that workflow - with the tools needed to create a pixel-perfect final image.

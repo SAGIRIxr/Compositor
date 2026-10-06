@@ -1,0 +1,33 @@
+#pragma code_page(65001)
+// Windows 资源：程序图标与版本信息。
+#include <winver.h>
+
+IDI_ICON1 ICON "compositor.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "Compositor"
+            VALUE "FileDescription", "Compositor image editor"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "InternalName", "Compositor"
+            VALUE "OriginalFilename", "Compositor.exe"
+            VALUE "ProductName", "Compositor"
+            VALUE "ProductVersion", "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

@@ -1,0 +1,113 @@
+name: Windows
+
+on:
+  push:
+    paths:
+      - 'windows/**'
+      - 'Compositor/Rendering/*.c'
+      - 'Compositor/Rendering/*.h'
+      - '.github/workflows/windows.yml'
+  pull_request:
+    paths:
+      - 'windows/**'
+      - 'Compositor/Rendering/*.c'
+      - 'Compositor/Rendering/*.h'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # 核心库不依赖 Qt，先在 Linux 上快速编译并跑单元测试。
+  core:
+    name: 核心库（Linux）
+    # push 覆盖本仓库分支；pull_request 只给 fork 用，避免同一个 PR 跑两遍。
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: 配置
+        run: cmake -S windows -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCOMPOSITOR_BUILD_APP=OFF
+
+      - name: 编译
+        run: cmake --build build
+
+      - name: 单元测试
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    name: Windows 构建与打包
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.*'
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: 设置 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 配置
+        run: cmake -S windows -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: 编译
+        run: cmake --build build
+
+      - name: 测试（核心库与界面冒烟测试）
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build --output-on-failure
+
+      - name: 打包便携版
+        shell: pwsh
+        run: |
+          cmake --install build --prefix dist/Compositor
+          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-compiler-runtime dist/Compositor/Compositor.exe
+          # MSVC 运行库随包附带，免得用户另装 VC++ 运行库。
+          $redist = Get-ChildItem "$env:VCToolsRedistDir\x64" -Directory | Where-Object Name -like 'Microsoft.VC*.CRT' | Select-Object -First 1
+          Copy-Item "$($redist.FullName)\*.dll" dist/Compositor/
+          Copy-Item windows/README.md dist/Compositor/说明.md
+          Copy-Item LICENSE dist/Compositor/LICENSE.txt
+          Compress-Archive -Path dist/Compositor -DestinationPath Compositor-Windows-x64.zip
+
+      - name: 生成安装包
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc /DSourceDir="$PWD\dist\Compositor" /DOutputDir="$PWD" windows\packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 上传便携版
+        uses: actions/upload-artifact@v7
+        with:
+          name: Compositor-Windows-x64
+          path: Compositor-Windows-x64.zip
+          retention-days: 30
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v7
+        with:
+          name: Compositor-Windows-x64-Setup
+          path: Compositor-Setup-*.exe
+          retention-days: 30
