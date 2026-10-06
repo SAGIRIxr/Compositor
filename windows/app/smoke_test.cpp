@@ -20,6 +20,8 @@
 #include <QListWidget>
 #include <QDialogButtonBox>
 #include <QPushButton>
+#include <QComboBox>
+#include "compositor/selection.h"
 #include <iostream>
 
 using namespace comp;
@@ -123,6 +125,44 @@ int main(int argc, char** argv) {
     action(window, QStringLiteral("redo"))->trigger();
     EXPECT(session->doc().find(painted)->extra.contains("effects"));
 
+    // 选区：在画线图层上框选左半边，清除后左边的线没了、右边还在。
+    action(window, QStringLiteral("tool_M"))->trigger();
+    drag(canvas, canvas->toWidget(QPointF(0, 0)).toPoint(), canvas->toWidget(QPointF(200, 300)).toPoint());
+    EXPECT(session->doc().selection != nullptr);
+    {
+        const Layer* l = session->doc().find(painted);
+        double y = l->transform.y;
+        action(window, QStringLiteral("clear"))->trigger();
+        l = session->doc().find(painted);
+        int py = int(200 - y);
+        EXPECT(l->image->at(150, py)[3] == 0);
+        EXPECT(l->image->at(250, py)[3] == 255);
+        action(window, QStringLiteral("undo"))->trigger();
+        EXPECT(session->doc().find(painted)->image->at(150, py)[3] == 255);
+    }
+    // 反选再取消选择。
+    action(window, QStringLiteral("inverse"))->trigger();
+    EXPECT(session->doc().selection && session->doc().selection->row(10)[300] == 255);
+    action(window, QStringLiteral("deselect"))->trigger();
+    EXPECT(!session->doc().selection);
+    // 魔棒点在黑线上（只取当前图层），选中的就是这条线。
+    action(window, QStringLiteral("tool_W"))->trigger();
+    QTest::mouseClick(canvas, Qt::LeftButton, Qt::NoModifier, canvas->toWidget(QPointF(200, 200)).toPoint());
+    {
+        int x, y, w, h;
+        EXPECT(session->doc().selection && selectionBounds(*session->doc().selection, x, y, w, h) && w > 150 && h < 60);
+    }
+    // 多边形套索：三次单击加回车。
+    action(window, QStringLiteral("tool_L"))->trigger();
+    window.findChildren<QComboBox*>();
+    for (auto* combo : window.findChildren<QComboBox*>()) if (combo->findText(QStringLiteral("多边形")) >= 0) combo->setCurrentIndex(1);
+    for (QPointF p : {QPointF(10, 10), QPointF(100, 10), QPointF(10, 100)}) {
+        QTest::mouseClick(canvas, Qt::LeftButton, Qt::NoModifier, canvas->toWidget(p).toPoint());
+    }
+    QTest::keyClick(canvas, Qt::Key_Return);
+    EXPECT(session->doc().selection && session->doc().selection->row(20)[20] == 255 && session->doc().selection->row(200)[200] == 0);
+    action(window, QStringLiteral("deselect"))->trigger();
+
     // 反相调整层（无参数，不弹编辑框）。
     action(window, QStringLiteral("adjust_Invert"))->trigger();
     EXPECT(session->doc().layers.size() == 3);
@@ -159,6 +199,13 @@ int main(int argc, char** argv) {
     QPoint background = canvas->toWidget(QPointF(50, 50)).toPoint(), line = canvas->toWidget(QPointF(200, 200)).toPoint();
     EXPECT(qGray(view.pixel(background)) < 10);
     EXPECT(qGray(view.pixel(line)) > 245);
+
+    // 截图前做一个椭圆选区，截图里能看到蚂蚁线。
+    for (auto* combo : window.findChildren<QComboBox*>()) if (combo->findText(QStringLiteral("椭圆")) >= 0) combo->setCurrentIndex(1);
+    action(window, QStringLiteral("tool_M"))->trigger();
+    drag(canvas, canvas->toWidget(QPointF(60, 40)).toPoint(), canvas->toWidget(QPointF(340, 260)).toPoint());
+    EXPECT(session->doc().selection != nullptr);
+    QTest::qWait(50);
 
     // 截图留档。
     QString shot = QString::fromLocal8Bit(qgetenv("COMPOSITOR_SMOKE_SCREENSHOT"));

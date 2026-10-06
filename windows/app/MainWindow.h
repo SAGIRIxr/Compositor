@@ -58,6 +58,12 @@ private:
     void exportPNG();
     void exportJPEG();
     void copyLayer(bool merged);
+    void cut();
+    void clearOrDelete();
+    void fillCurrent();
+    void contentFill();
+    void modifySelection(int kind);
+    void updateToolOptions();
     void paste();
     void canvasSize();
     void imageSize();
@@ -81,6 +87,7 @@ private:
     QSpinBox* brushSize_;
     QSpinBox* brushHardness_;
     QSpinBox* brushOpacity_;
+    QHash<int, QList<QAction*>> toolOptions_; // 工具 → 选项栏里属于它的控件
     ColorButton* foreground_;
     ColorButton* background_;
     QPointer<Session> watched_;

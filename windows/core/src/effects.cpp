@@ -1,6 +1,7 @@
 #include "compositor/effects.h"
 #include "compositor/document.h"
 #include "parallel.h"
+#include "planes.h"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -25,7 +26,7 @@ bool flag(const Json& o, const char* key, bool fallback) {
     return it->get<bool>();
 }
 
-using Plane = std::vector<float>;
+using detail::Plane;
 
 // 单调队列求窗口内最大（或最小）值，越界处为 0，耗时与半径无关。
 void extremePass(const float* in, float* out, int lines, int count, size_t lineStep, size_t elementStep, int radius, bool smallest) {
@@ -53,7 +54,7 @@ void extremePass(const float* in, float* out, int lines, int count, size_t lineS
     }, 4);
 }
 
-Plane extreme(const Plane& source, int w, int h, int reach, bool smallest) {
+Plane extremeImpl(const Plane& source, int w, int h, int reach, bool smallest) {
     Plane pass(source.size()), result(source.size());
     extremePass(source.data(), pass.data(), h, w, size_t(w), 1, reach, smallest);
     extremePass(pass.data(), result.data(), w, h, 1, size_t(w), reach, smallest);
@@ -78,7 +79,7 @@ void boxPass(const float* in, float* out, int lines, int count, size_t lineStep,
 }
 
 // 三次盒式模糊近似高斯（σ），边缘外延。
-void blur(Plane& plane, int w, int h, double sigma) {
+void blurImpl(Plane& plane, int w, int h, double sigma) {
     if (sigma < 0.3) return;
     double ideal = std::sqrt(12 * sigma * sigma / 3 + 1);
     int wl = int(std::floor(ideal));
@@ -126,6 +127,13 @@ bool colorValid(const double c[3]) {
 }
 
 } // namespace
+
+namespace detail {
+void blurPlane(Plane& plane, int width, int height, double sigma) { blurImpl(plane, width, height, sigma); }
+Plane extremePlane(const Plane& source, int width, int height, int reach, bool smallest) {
+    return extremeImpl(source, width, height, reach, smallest);
+}
+} // namespace detail
 
 const std::vector<EffectKind>& allEffectKinds() {
     static const std::vector<EffectKind> kinds = {EffectKind::Stroke, EffectKind::Shadow, EffectKind::ColorOverlay,
@@ -256,7 +264,7 @@ EffectsImage renderEffects(const Image& shown, const LayerEffectsParams& p) {
     Plane ring;
     if (stroke) {
         int reach = std::max(1, int(std::lround(stroke->size)));
-        Plane moved = extreme(shape, w, h, reach, stroke->inside);
+        Plane moved = extremeImpl(shape, w, h, reach, stroke->inside);
         ring.resize(count);
         for (size_t i = 0; i < count; ++i) ring[i] = std::clamp(stroke->inside ? shape[i] - moved[i] : moved[i] - shape[i], 0.0f, 1.0f);
     }
@@ -266,7 +274,7 @@ EffectsImage renderEffects(const Image& shown, const LayerEffectsParams& p) {
         double dx, dy;
         shadowOffset(*shadow, dx, dy);
         shadowPlane = shifted(shape, w, h, dx, dy);
-        blur(shadowPlane, w, h, shadow->blur / 2);
+        blurImpl(shadowPlane, w, h, shadow->blur / 2);
     }
     const EffectParams* inner = visible(EffectKind::InnerShadow);
     Plane innerPlane;
@@ -274,20 +282,20 @@ EffectsImage renderEffects(const Image& shown, const LayerEffectsParams& p) {
         double dx, dy;
         shadowOffset(*inner, dx, dy);
         Plane moved = shifted(shape, w, h, dx, dy);
-        blur(moved, w, h, inner->blur / 2);
+        blurImpl(moved, w, h, inner->blur / 2);
         innerPlane.resize(count);
         for (size_t i = 0; i < count; ++i) innerPlane[i] = std::clamp(shape[i] * (1 - moved[i]), 0.0f, 1.0f);
     }
     const EffectParams* glow = visible(EffectKind::OuterGlow);
     if (glow && glow->size <= 0) glow = nullptr;
     Plane glowPlane;
-    if (glow) { glowPlane = shape; blur(glowPlane, w, h, glow->size / 2); }
+    if (glow) { glowPlane = shape; blurImpl(glowPlane, w, h, glow->size / 2); }
     const EffectParams* innerGlow = visible(EffectKind::InnerGlow);
     if (innerGlow && innerGlow->size <= 0) innerGlow = nullptr;
     Plane innerGlowPlane;
     if (innerGlow) {
         Plane soft = shape;
-        blur(soft, w, h, innerGlow->size / 2);
+        blurImpl(soft, w, h, innerGlow->size / 2);
         innerGlowPlane.resize(count);
         for (size_t i = 0; i < count; ++i) innerGlowPlane[i] = std::clamp(shape[i] * (1 - soft[i]), 0.0f, 1.0f);
     }

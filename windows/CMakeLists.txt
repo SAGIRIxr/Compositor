@@ -45,6 +45,7 @@ add_library(compositor_core STATIC
     core/src/image_io.cpp
     core/src/project_io.cpp
     core/src/renderer.cpp
+    core/src/selection.cpp
     core/src/transform.cpp
     core/src/uuid.cpp
 )

@@ -11,6 +11,7 @@
 #include "compositor/image_io.h"
 #include "compositor/project_io.h"
 #include "compositor/renderer.h"
+#include "compositor/selection.h"
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
@@ -22,6 +23,8 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QImageReader>
+#include <QInputDialog>
+#include <QComboBox>
 #include <QLabel>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -119,15 +122,40 @@ void MainWindow::createActions() {
     add("copy", QStringLiteral("拷贝图层"), QKeySequence::Copy, [this] { copyLayer(false); });
     add("copyMerged", QStringLiteral("合并拷贝"), QKeySequence(QStringLiteral("Ctrl+Shift+C")), [this] { copyLayer(true); });
     add("paste", QStringLiteral("粘贴为新图层"), QKeySequence::Paste, [this] { paste(); });
-    add("fill", QStringLiteral("用前景色填充图层"), QKeySequence(QStringLiteral("Alt+Backspace")), [this] {
-        QColor c = tools_.foreground;
-        const uint8_t color[4] = {uint8_t(c.red()), uint8_t(c.green()), uint8_t(c.blue()), 255};
+    add("fill", QStringLiteral("用前景色填充"), QKeySequence(QStringLiteral("Alt+Backspace")), [this] { fillCurrent(); });
+    add("contentFill", QStringLiteral("内容识别填充"), QKeySequence(QStringLiteral("Shift+Backspace")), [this] { contentFill(); });
+    add("cut", QStringLiteral("剪切"), QKeySequence::Cut, [this] { cut(); });
+    add("clear", QStringLiteral("清除选区内容"), QKeySequence(), [this] { clearOrDelete(); });
+    // 选择
+    add("selectAll", QStringLiteral("全部"), QKeySequence::SelectAll, [this] {
+        editCurrent(QStringLiteral("全选"), [](Document& d) { d.selection = std::make_shared<GrayImage>(d.width, d.height, 255); });
+    });
+    add("deselect", QStringLiteral("取消选择"), QKeySequence(QStringLiteral("Ctrl+D")), [this] {
+        Session* s = currentSession();
+        if (s && s->doc().selection) editCurrent(QStringLiteral("取消选择"), [](Document& d) { d.selection.reset(); });
+    });
+    add("inverse", QStringLiteral("反选"), QKeySequence(QStringLiteral("Ctrl+Shift+I")), [this] {
+        editCurrent(QStringLiteral("反选"), [](Document& d) {
+            GrayImage inverted = invertSelection(d.selection.get(), d.width, d.height);
+            d.selection = selectionIsEmpty(inverted) ? nullptr : std::make_shared<GrayImage>(std::move(inverted));
+        });
+    });
+    add("feather", QStringLiteral("羽化…"), QKeySequence(QStringLiteral("Shift+F6")), [this] { modifySelection(0); });
+    add("expand", QStringLiteral("扩展…"), QKeySequence(), [this] { modifySelection(1); });
+    add("contract", QStringLiteral("收缩…"), QKeySequence(), [this] { modifySelection(2); });
+    add("loadSelection", QStringLiteral("载入图层选区"), QKeySequence(), [this] {
         Session* s = currentSession();
         if (!s) return;
-        std::string id = s->doc().activeLayerID;
-        const Layer* l = s->doc().find(id);
-        if (!l || l->isGroup || l->isAdjustment()) { statusBar()->showMessage(QStringLiteral("只能填充像素图层。"), 3000); return; }
-        editCurrent(QStringLiteral("填充"), [&](Document& d) { fillLayer(d, id, color); });
+        const Layer* layer = s->doc().find(s->doc().activeLayerID);
+        if (!layer || layer->isGroup || layer->isAdjustment()) return;
+        GrayImage selection = selectionFromLayer(s->doc(), *layer);
+        editCurrent(QStringLiteral("载入选区"), [&](Document& d) {
+            d.selection = selectionIsEmpty(selection) ? nullptr : std::make_shared<GrayImage>(std::move(selection));
+        });
+    });
+    add("crop", QStringLiteral("裁剪到选区"), QKeySequence(), [this] {
+        editCurrent(QStringLiteral("裁剪"), [](Document& d) { cropToSelection(d); });
+        if (auto* c = currentCanvas()) c->fitToWindow();
     });
     // 图像
     add("canvasSize", QStringLiteral("画布大小…"), QKeySequence(QStringLiteral("Ctrl+Alt+C")), [this] { canvasSize(); });
@@ -165,7 +193,12 @@ void MainWindow::createActions() {
     add("lower", QStringLiteral("下移一层"), QKeySequence(QStringLiteral("Ctrl+[")), [this] { editCurrent(QStringLiteral("下移图层"), [](Document& d) { moveLayer(d, d.activeLayerID, -1); }); });
     add("flipLayerH", QStringLiteral("水平翻转图层"), QKeySequence(), [this] { editCurrent(QStringLiteral("水平翻转图层"), [](Document& d) { flipLayer(d, d.activeLayerID, true); }); });
     add("flipLayerV", QStringLiteral("垂直翻转图层"), QKeySequence(), [this] { editCurrent(QStringLiteral("垂直翻转图层"), [](Document& d) { flipLayer(d, d.activeLayerID, false); }); });
-    add("addMask", QStringLiteral("添加蒙版（显示全部）"), QKeySequence(), [this] { editCurrent(QStringLiteral("添加蒙版"), [](Document& d) { addMask(d, d.activeLayerID, true); }); });
+    add("addMask", QStringLiteral("添加蒙版（有选区时显示选区）"), QKeySequence(), [this] {
+        editCurrent(QStringLiteral("添加蒙版"), [](Document& d) {
+            if (d.selection) maskFromSelection(d, d.activeLayerID, *d.selection);
+            else addMask(d, d.activeLayerID, true);
+        });
+    });
     add("addMaskHide", QStringLiteral("添加蒙版（隐藏全部）"), QKeySequence(), [this] { editCurrent(QStringLiteral("添加蒙版"), [](Document& d) { addMask(d, d.activeLayerID, false); }); });
     add("toggleMask", QStringLiteral("停用/启用蒙版"), QKeySequence(), [this] {
         editCurrent(QStringLiteral("停用蒙版"), [](Document& d) { if (Layer* l = d.find(d.activeLayerID); l && l->mask) l->maskEnabled = !l->maskEnabled; });
@@ -225,7 +258,7 @@ void MainWindow::createActions() {
     addAction(reset);
     auto* deleteKey = new QAction(this);
     deleteKey->setShortcut(QKeySequence::Delete);
-    connect(deleteKey, &QAction::triggered, actions_["delete"], &QAction::trigger);
+    connect(deleteKey, &QAction::triggered, this, [this] { clearOrDelete(); });
     addAction(deleteKey);
 
     adjustmentMenu_ = new QMenu(QStringLiteral("新建调整图层"), this);
@@ -258,15 +291,19 @@ void MainWindow::createMenus() {
     edit->addAction(actions_["undo"]);
     edit->addAction(actions_["redo"]);
     edit->addSeparator();
+    edit->addAction(actions_["cut"]);
     edit->addAction(actions_["copy"]);
     edit->addAction(actions_["copyMerged"]);
     edit->addAction(actions_["paste"]);
+    edit->addAction(actions_["clear"]);
     edit->addSeparator();
     edit->addAction(actions_["fill"]);
+    edit->addAction(actions_["contentFill"]);
 
     QMenu* image = menuBar()->addMenu(QStringLiteral("图像(&I)"));
     image->addAction(actions_["imageSize"]);
     image->addAction(actions_["canvasSize"]);
+    image->addAction(actions_["crop"]);
     image->addSeparator();
     image->addAction(actions_["flipCanvasH"]);
     image->addAction(actions_["flipCanvasV"]);
@@ -295,6 +332,17 @@ void MainWindow::createMenus() {
     layer->addAction(actions_["clearEffects"]);
     layer->addAction(actions_["editAdjustment"]);
 
+    QMenu* select = menuBar()->addMenu(QStringLiteral("选择(&S)"));
+    select->addAction(actions_["selectAll"]);
+    select->addAction(actions_["deselect"]);
+    select->addAction(actions_["inverse"]);
+    select->addSeparator();
+    select->addAction(actions_["feather"]);
+    select->addAction(actions_["expand"]);
+    select->addAction(actions_["contract"]);
+    select->addSeparator();
+    select->addAction(actions_["loadSelection"]);
+
     QMenu* view = menuBar()->addMenu(QStringLiteral("视图(&V)"));
     view->addAction(actions_["zoomIn"]);
     view->addAction(actions_["zoomOut"]);
@@ -311,6 +359,7 @@ void MainWindow::createMenus() {
     for (const char* key : {"newLayer", "newGroup", "duplicate", "delete", "groupLayer", "mergeDown", "clip"}) layerContextMenu_->addAction(actions_[key]);
     layerContextMenu_->addSeparator();
     for (const char* key : {"addMask", "toggleMask", "invertMask", "applyMask", "deleteMask"}) layerContextMenu_->addAction(actions_[key]);
+    layerContextMenu_->addAction(actions_["loadSelection"]);
     layerContextMenu_->addSeparator();
     layerContextMenu_->addAction(actions_["effects"]);
     layerContextMenu_->addAction(actions_["clearEffects"]);
@@ -328,6 +377,9 @@ void MainWindow::createToolBars() {
     struct ToolInfo { Tool tool; const char* name; const char* key; const char* tip; };
     const ToolInfo infos[] = {
         {Tool::Move, "移动", "V", "移动工具（V）：拖动移动图层，拖动手柄缩放（Shift 等比，Alt 以中心），在角外拖动旋转"},
+        {Tool::Marquee, "选框", "M", "选框工具（M）：拖出矩形或椭圆选区。按下时 Shift 添加、Alt 减去、Shift+Alt 交叉；拖动中 Shift 约束比例、Alt 从中心"},
+        {Tool::Lasso, "套索", "L", "套索工具（L）：自由或多边形。多边形模式下单击加点，双击、回车或点回起点闭合，Esc 取消"},
+        {Tool::Wand, "魔棒", "W", "魔棒工具（W）：选取相近的颜色"},
         {Tool::Brush, "画笔", "B", "画笔工具（B）：Shift 点击画直线，[ ] 调整大小"},
         {Tool::Eraser, "橡皮", "E", "橡皮擦工具（E）"},
         {Tool::Eyedropper, "吸管", "I", "吸管工具（I）：点击取前景色，Alt 点击取背景色"},
@@ -368,12 +420,49 @@ void MainWindow::createToolBars() {
         options->addWidget(box);
         return box;
     };
+    auto track = [&](Tool tool, QAction* action) { toolOptions_[int(tool)].append(action); };
+    auto label = [&](const QString& text) { return options->addWidget(new QLabel(QStringLiteral("  %1 ").arg(text))); };
+    // 画笔与橡皮
+    int before = options->actions().size();
     brushSize_ = spin(QStringLiteral("大小"), 1, 5000, int(tools_.brush.size), QStringLiteral(" 像素"));
     brushHardness_ = spin(QStringLiteral("硬度"), 0, 100, int(tools_.brush.hardness * 100), QStringLiteral("%"));
     brushOpacity_ = spin(QStringLiteral("不透明度"), 1, 100, int(tools_.brush.opacity * 100), QStringLiteral("%"));
+    for (int i = before; i < options->actions().size(); ++i) { track(Tool::Brush, options->actions()[i]); track(Tool::Eraser, options->actions()[i]); }
     connect(brushSize_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) { tools_.brush.size = v; tools_.notify(); });
     connect(brushHardness_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) { tools_.brush.hardness = v / 100.0; tools_.notify(); });
     connect(brushOpacity_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) { tools_.brush.opacity = v / 100.0; tools_.notify(); });
+    // 选框
+    track(Tool::Marquee, label(QStringLiteral("形状")));
+    auto* shape = new QComboBox;
+    shape->addItems({QStringLiteral("矩形"), QStringLiteral("椭圆")});
+    track(Tool::Marquee, options->addWidget(shape));
+    connect(shape, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) { tools_.marqueeEllipse = i == 1; tools_.notify(); });
+    // 套索
+    track(Tool::Lasso, label(QStringLiteral("方式")));
+    auto* lasso = new QComboBox;
+    lasso->addItems({QStringLiteral("自由"), QStringLiteral("多边形")});
+    track(Tool::Lasso, options->addWidget(lasso));
+    connect(lasso, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) { tools_.lassoPolygon = i == 1; tools_.notify(); });
+    // 魔棒
+    QSpinBox* tolerance = nullptr;
+    {
+        int start = options->actions().size();
+        tolerance = spin(QStringLiteral("容差"), 0, 255, tools_.wandTolerance, QString());
+        for (int i = start; i < options->actions().size(); ++i) track(Tool::Wand, options->actions()[i]);
+    }
+    connect(tolerance, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) { tools_.wandTolerance = v; });
+    auto* contiguous = new QCheckBox(QStringLiteral("连续"));
+    contiguous->setChecked(tools_.wandContiguous);
+    track(Tool::Wand, options->addWidget(contiguous));
+    connect(contiguous, &QCheckBox::toggled, this, [this](bool on) { tools_.wandContiguous = on; });
+    auto* allLayers = new QCheckBox(QStringLiteral("对所有图层取样"));
+    track(Tool::Wand, options->addWidget(allLayers));
+    connect(allLayers, &QCheckBox::toggled, this, [this](bool on) { tools_.wandAllLayers = on; });
+    // 选区工具共用的提示。
+    QAction* hint = label(QStringLiteral("<span style='color:gray'>Shift 添加 · Alt 减去 · Shift+Alt 交叉</span>"));
+    for (Tool t : {Tool::Marquee, Tool::Lasso, Tool::Wand}) track(t, hint);
+    connect(&tools_, &ToolState::changed, this, [this] { updateToolOptions(); });
+    updateToolOptions();
     options->addSeparator();
     options->addAction(actions_["undo"]);
     options->addAction(actions_["redo"]);
@@ -421,7 +510,10 @@ void MainWindow::addSession(Session* session) {
     connect(session, &Session::historyChanged, this, [this, canvas] { if (canvas == currentCanvas()) updateActions(); });
     connect(session, &Session::activeLayerChanged, this, [this, canvas] { if (canvas == currentCanvas()) updateActions(); });
     connect(session, &Session::documentChanged, this, [this, canvas, session](bool) {
-        if (canvas == currentCanvas()) sizeLabel_->setText(QStringLiteral("%1 × %2 像素").arg(session->doc().width).arg(session->doc().height));
+        if (canvas == currentCanvas()) {
+            sizeLabel_->setText(QStringLiteral("%1 × %2 像素").arg(session->doc().width).arg(session->doc().height));
+            updateActions();
+        }
     });
     connect(session, &Session::reloadedFromDisk, this, [this] { statusBar()->showMessage(QStringLiteral("项目已在磁盘上更新，已重新载入。"), 4000); });
     connect(session, &Session::externalChangeConflict, this, [this, session] {
@@ -478,6 +570,11 @@ void MainWindow::updateActions() {
     actions_["applyMask"]->setEnabled(pixel && layer->mask);
     actions_["editAdjustment"]->setEnabled(layer && layer->isAdjustment());
     adjustmentMenu_->setEnabled(has);
+    bool selection = s && s->doc().selection;
+    for (const char* key : {"deselect", "feather", "expand", "contract", "crop", "contentFill", "clear", "cut"}) actions_[key]->setEnabled(selection);
+    for (const char* key : {"selectAll", "inverse"}) actions_[key]->setEnabled(has);
+    actions_["loadSelection"]->setEnabled(pixel);
+    if (selection) actions_["copy"]->setEnabled(true);
     actions_["undo"]->setEnabled(s && s->canUndo());
     actions_["redo"]->setEnabled(s && s->canRedo());
     actions_["undo"]->setText(s && s->canUndo() ? QStringLiteral("撤销 %1").arg(s->undoName()) : QStringLiteral("撤销"));
@@ -674,9 +771,95 @@ void MainWindow::exportJPEG() {
     else statusBar()->showMessage(QStringLiteral("已导出 %1").arg(QDir::toNativeSeparators(path)), 4000);
 }
 
+void MainWindow::updateToolOptions() {
+    for (auto it = toolOptions_.begin(); it != toolOptions_.end(); ++it) {
+        for (QAction* a : it.value()) a->setVisible(false);
+    }
+    for (QAction* a : toolOptions_.value(int(tools_.tool))) a->setVisible(true);
+}
+
+void MainWindow::clearOrDelete() {
+    Session* s = currentSession();
+    if (!s) return;
+    if (!s->doc().selection) { actions_["delete"]->trigger(); return; }
+    const Layer* layer = s->doc().find(s->doc().activeLayerID);
+    if (!layer || layer->isGroup || layer->isAdjustment()) {
+        statusBar()->showMessage(QStringLiteral("请选择一个像素图层再清除选区内容。"), 4000);
+        return;
+    }
+    editCurrent(QStringLiteral("清除"), [](Document& d) { clearSelection(d, d.activeLayerID, *d.selection); });
+}
+
+void MainWindow::fillCurrent() {
+    Session* s = currentSession();
+    if (!s) return;
+    QColor c = tools_.foreground;
+    const uint8_t color[4] = {uint8_t(c.red()), uint8_t(c.green()), uint8_t(c.blue()), 255};
+    const Layer* l = s->doc().find(s->doc().activeLayerID);
+    if (!l || l->isGroup || l->isAdjustment()) { statusBar()->showMessage(QStringLiteral("只能填充像素图层。"), 3000); return; }
+    editCurrent(QStringLiteral("填充"), [&](Document& d) {
+        if (d.selection) fillSelection(d, d.activeLayerID, *d.selection, color);
+        else fillLayer(d, d.activeLayerID, color);
+    });
+}
+
+void MainWindow::contentFill() {
+    Session* s = currentSession();
+    if (!s) return;
+    if (!s->doc().selection) { statusBar()->showMessage(QStringLiteral("先选出要填充的区域。"), 4000); return; }
+    Document copy = s->doc();
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    int result = contentAwareFill(copy, copy.activeLayerID, *copy.selection);
+    QApplication::restoreOverrideCursor();
+    if (result == 1) { editCurrent(QStringLiteral("内容识别填充"), [&](Document& d) { d = std::move(copy); }); return; }
+    if (result == -2) showError(QStringLiteral("内容识别填充"), QStringLiteral("请选择一个有像素的图层。"));
+    else if (result == 0) showError(QStringLiteral("内容识别填充"), QStringLiteral("选区周围没有足够的不透明像素可以取样。换一个小一点、周围有画面的选区试试。"));
+    else showError(QStringLiteral("内容识别填充"), QStringLiteral("内存不足。"));
+}
+
+void MainWindow::modifySelection(int kind) {
+    Session* s = currentSession();
+    if (!s || !s->doc().selection) return;
+    bool ok = false;
+    double value = kind == 0
+        ? QInputDialog::getDouble(this, QStringLiteral("羽化选区"), QStringLiteral("羽化半径（像素）："), 5, 0.1, 1000, 1, &ok)
+        : QInputDialog::getInt(this, kind == 1 ? QStringLiteral("扩展选区") : QStringLiteral("收缩选区"),
+                               kind == 1 ? QStringLiteral("扩展量（像素）：") : QStringLiteral("收缩量（像素）："), 5, 1, 500, 1, &ok);
+    if (!ok) return;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    GrayImage selection = *s->doc().selection;
+    if (kind == 0) featherSelection(selection, value);
+    else growSelection(selection, kind == 1 ? int(value) : -int(value));
+    QApplication::restoreOverrideCursor();
+    const QString names[3] = {QStringLiteral("羽化"), QStringLiteral("扩展"), QStringLiteral("收缩")};
+    editCurrent(names[kind], [&](Document& d) {
+        d.selection = selectionIsEmpty(selection) ? nullptr : std::make_shared<GrayImage>(std::move(selection));
+    });
+}
+
+void MainWindow::cut() {
+    Session* s = currentSession();
+    if (!s || !s->doc().selection) { copyLayer(false); return; }
+    copyLayer(false);
+    clearOrDelete();
+}
+
 void MainWindow::copyLayer(bool merged) {
     Session* s = currentSession();
     if (!s) return;
+    if (s->doc().selection) {
+        // 有选区：只拷贝选区里的部分，裁到选区大小。
+        const Layer* layer = s->doc().find(s->doc().activeLayerID);
+        Image source;
+        if (merged || !layer || layer->isGroup || layer->isAdjustment()) source = flatten(s->doc());
+        else source = renderLayerAlone(s->doc(), *layer);
+        int x = 0, y = 0;
+        Image piece = copySelection(source, *s->doc().selection, x, y);
+        if (piece.empty()) return;
+        QApplication::clipboard()->setImage(toQImage(piece));
+        statusBar()->showMessage(QStringLiteral("已拷贝选区（%1 × %2）。").arg(piece.width).arg(piece.height), 3000);
+        return;
+    }
     if (merged) {
         QApplication::clipboard()->setImage(toQImage(flatten(s->doc())));
         statusBar()->showMessage(QStringLiteral("已拷贝合并后的画面。"), 3000);
@@ -779,7 +962,11 @@ void MainWindow::addAdjustment(int kind) {
     uint32_t seed = QRandomGenerator::global()->generate();
     std::string id;
     editCurrent(QStringLiteral("新建%1").arg(QString::fromUtf8(adjustmentKindLabel(AdjustmentKind(kind)))),
-                [&](Document& d) { id = addAdjustmentLayer(d, AdjustmentKind(kind), seed); });
+                [&](Document& d) {
+                    id = addAdjustmentLayer(d, AdjustmentKind(kind), seed);
+                    // 有选区时调整只作用在选区内（与 Photoshop 一样以选区做蒙版）。
+                    if (d.selection) maskFromSelection(d, id, *d.selection);
+                });
     if (AdjustmentKind(kind) != AdjustmentKind::Invert && !id.empty()) editAdjustment(QString::fromStdString(id));
 }
 

@@ -48,7 +48,13 @@ CanvasView::CanvasView(Session* session, ToolState* tools, QWidget* parent)
     connect(session_, &Session::documentChanged, this, [this](bool) { invalidate(); });
     connect(session_, &Session::pixelsChanged, this, [this](QRectF rect) { renderRegion(rect); update(); });
     connect(session_, &Session::activeLayerChanged, this, [this] { update(); });
-    connect(tools_, &ToolState::changed, this, [this] { updateCursor(); update(); });
+    connect(tools_, &ToolState::changed, this, [this] {
+        if (tools_->tool != Tool::Lasso || !tools_->lassoPolygon) cancelPolygon();
+        updateCursor();
+        update();
+    });
+    antsTimer_.setInterval(180);
+    connect(&antsTimer_, &QTimer::timeout, this, [this] { antsOffset_ = (antsOffset_ + 1) % 8; update(); });
 }
 
 void CanvasView::invalidate() {
@@ -60,6 +66,7 @@ QPointF CanvasView::toDocument(QPointF p) const { return (p - pan_) / zoom_; }
 QPointF CanvasView::toWidget(QPointF p) const { return p * zoom_ + pan_; }
 
 void CanvasView::setZoom(double zoom, QPointF anchor) {
+    autoFit_ = false;
     zoom = std::clamp(zoom, 0.01, 64.0);
     if (anchor.x() < 0) anchor = QPointF(width() / 2.0, height() / 2.0);
     QPointF documentPoint = toDocument(anchor);
@@ -89,6 +96,7 @@ void CanvasView::fitToWindow() {
     double dpr = devicePixelRatioF();
     pan_ = QPointF(std::round(pan_.x() * dpr) / dpr, std::round(pan_.y() * dpr) / dpr);
     fitted_ = true;
+    autoFit_ = true;
     emit zoomChanged(zoom_);
     invalidate();
 }
@@ -103,7 +111,7 @@ void CanvasView::showEvent(QShowEvent*) {
 }
 
 void CanvasView::resizeEvent(QResizeEvent*) {
-    if (!fitted_ && isVisible()) fitToWindow();
+    if ((!fitted_ || autoFit_) && isVisible()) fitToWindow();
     invalidate();
 }
 
@@ -179,6 +187,7 @@ void CanvasView::paintEvent(QPaintEvent*) {
             else { double x = toWidget(QPointF(g.position, 0)).x(); painter.drawLine(QPointF(x, 0), QPointF(x, height())); }
         }
     }
+    drawSelection(painter);
     // 移动工具：画出选中图层的变换框与手柄。
     if (effectiveTool() == Tool::Move) {
         if (const Layer* layer = transformTarget()) {
@@ -251,7 +260,10 @@ void CanvasView::updateCursor(QPointF p) {
     case Tool::Hand: setCursor(drag_ == DragMode::Pan ? Qt::ClosedHandCursor : Qt::OpenHandCursor); return;
     case Tool::Brush:
     case Tool::Eraser: setCursor(Qt::CrossCursor); return;
-    case Tool::Eyedropper: setCursor(Qt::CrossCursor); return;
+    case Tool::Eyedropper:
+    case Tool::Marquee:
+    case Tool::Lasso:
+    case Tool::Wand: setCursor(Qt::CrossCursor); return;
     case Tool::Zoom: setCursor(Qt::PointingHandCursor); return;
     case Tool::Move: {
         int hit = drag_ == DragMode::None ? hitTransform(p) : handle_;
@@ -354,6 +366,32 @@ void CanvasView::mousePressEvent(QMouseEvent* event) {
         else { drag_ = DragMode::Move; session_->checkpoint(QStringLiteral("移动")); }
         return;
     }
+    case Tool::Marquee:
+        drag_ = DragMode::Marquee;
+        selectMode_ = modeFor(event->modifiers());
+        pressModifiers_ = event->modifiers();
+        return;
+    case Tool::Lasso:
+        if (tools_->lassoPolygon) {
+            if (!polygonActive_) {
+                polygonActive_ = true;
+                selectMode_ = modeFor(event->modifiers());
+                lassoPoints_ = {d};
+            } else if (lassoPoints_.size() >= 3 && QLineF(toWidget(lassoPoints_.front()), p).length() <= 6) {
+                closePolygon();
+            } else {
+                lassoPoints_.push_back(d);
+            }
+            update();
+            return;
+        }
+        drag_ = DragMode::Lasso;
+        selectMode_ = modeFor(event->modifiers());
+        lassoPoints_ = {d};
+        return;
+    case Tool::Wand:
+        wandAt(d, modeFor(event->modifiers()));
+        return;
     case Tool::Hand:
         return;
     }
@@ -422,6 +460,7 @@ void CanvasView::mouseMoveEvent(QMouseEvent* event) {
     switch (drag_) {
     case DragMode::Pan:
         pan_ = panStart_ + (p - dragStartWidget_);
+        autoFit_ = false;
         invalidate();
         break;
     case DragMode::Paint:
@@ -462,7 +501,15 @@ void CanvasView::mouseMoveEvent(QMouseEvent* event) {
         session_->notifyChanged(false);
         break;
     }
+    case DragMode::Marquee:
+        update();
+        break;
+    case DragMode::Lasso:
+        if (lassoPoints_.empty() || QLineF(toWidget(lassoPoints_.back()), p).length() >= 1.5) lassoPoints_.push_back(d);
+        update();
+        break;
     case DragMode::None:
+        if (polygonActive_) update();
         if (effectiveTool() == Tool::Move) updateCursor(p);
         if (effectiveTool() == Tool::Brush || effectiveTool() == Tool::Eraser) {
             double r = tools_->brush.size / 2 * zoom_ + 4;
@@ -474,7 +521,35 @@ void CanvasView::mouseMoveEvent(QMouseEvent* event) {
     lastWidget_ = p;
 }
 
-void CanvasView::mouseReleaseEvent(QMouseEvent*) {
+void CanvasView::mouseReleaseEvent(QMouseEvent* event) {
+    if (drag_ == DragMode::Marquee) {
+        QRectF rect = marqueeRect(toDocument(event->position()), event->modifiers());
+        drag_ = DragMode::None;
+        const Document& doc = session_->doc();
+        if (rect.width() < 1 || rect.height() < 1) {
+            // 单击：替换模式下取消选择。
+            if (selectMode_ == SelectionMode::Replace && doc.selection) {
+                session_->edit(QStringLiteral("取消选择"), [](Document& d) { d.selection.reset(); }, false);
+            }
+        } else {
+            commitSelection(rectSelection(doc.width, doc.height, rect.x(), rect.y(), rect.width(), rect.height(), tools_->marqueeEllipse),
+                            selectMode_, tools_->marqueeEllipse ? QStringLiteral("椭圆选框") : QStringLiteral("矩形选框"));
+        }
+        update();
+        return;
+    }
+    if (drag_ == DragMode::Lasso) {
+        drag_ = DragMode::None;
+        if (lassoPoints_.size() >= 3) {
+            std::vector<StrokePoint> points;
+            for (QPointF q : lassoPoints_) points.push_back({q.x(), q.y()});
+            const Document& doc = session_->doc();
+            commitSelection(polygonSelection(doc.width, doc.height, points), selectMode_, QStringLiteral("套索"));
+        }
+        lassoPoints_.clear();
+        update();
+        return;
+    }
     if (drag_ == DragMode::Paint) {
         stroke_.reset();
         session_->notifyChanged(false); // 刷新缩略图
@@ -487,6 +562,7 @@ void CanvasView::mouseReleaseEvent(QMouseEvent*) {
 }
 
 void CanvasView::mouseDoubleClickEvent(QMouseEvent* event) {
+    if (polygonActive_) { closePolygon(); return; }
     if (effectiveTool() == Tool::Hand) fitToWindow();
     else if (effectiveTool() == Tool::Zoom) actualPixels();
     else QWidget::mouseDoubleClickEvent(event);
@@ -501,6 +577,7 @@ void CanvasView::wheelEvent(QWheelEvent* event) {
     } else {
         if (event->modifiers() & Qt::ShiftModifier) delta = QPointF(delta.y(), delta.x());
         pan_ += delta;
+        autoFit_ = false;
         invalidate();
     }
     event->accept();
@@ -524,6 +601,18 @@ void CanvasView::keyPressEvent(QKeyEvent* event) {
         updateCursor();
         update();
         return;
+    }
+    if (polygonActive_) {
+        switch (event->key()) {
+        case Qt::Key_Return:
+        case Qt::Key_Enter: closePolygon(); return;
+        case Qt::Key_Escape: cancelPolygon(); return;
+        case Qt::Key_Backspace:
+            if (lassoPoints_.size() > 1) lassoPoints_.pop_back(); else cancelPolygon();
+            update();
+            return;
+        default: break;
+        }
     }
     int step = event->modifiers() & Qt::ShiftModifier ? 10 : 1;
     if (tools_->tool == Tool::Move && drag_ == DragMode::None) {
@@ -551,4 +640,133 @@ void CanvasView::keyReleaseEvent(QKeyEvent* event) {
 void CanvasView::leaveEvent(QEvent*) {
     hover_ = QPointF(-1, -1);
     update();
+}
+
+SelectionMode CanvasView::modeFor(Qt::KeyboardModifiers m) {
+    bool shift = m & Qt::ShiftModifier, alt = m & Qt::AltModifier;
+    if (shift && alt) return SelectionMode::Intersect;
+    if (shift) return SelectionMode::Add;
+    if (alt) return SelectionMode::Subtract;
+    return SelectionMode::Replace;
+}
+
+QRectF CanvasView::marqueeRect(QPointF current, Qt::KeyboardModifiers m) const {
+    QPointF start = dragStartDocument_;
+    double dx = current.x() - start.x(), dy = current.y() - start.y();
+    // 按下时没用来选模式的修饰键，拖动中才起作用：Shift 正方形/正圆，Alt 从中心画。
+    if ((m & Qt::ShiftModifier) && !(pressModifiers_ & Qt::ShiftModifier)) {
+        double side = std::max(std::abs(dx), std::abs(dy));
+        dx = dx < 0 ? -side : side;
+        dy = dy < 0 ? -side : side;
+    }
+    QRectF rect;
+    if ((m & Qt::AltModifier) && !(pressModifiers_ & Qt::AltModifier)) rect = QRectF(start - QPointF(dx, dy), start + QPointF(dx, dy));
+    else rect = QRectF(start, start + QPointF(dx, dy));
+    rect = rect.normalized();
+    // 对齐到整像素，选区边缘清晰。
+    return QRectF(QPointF(std::round(rect.left()), std::round(rect.top())), QPointF(std::round(rect.right()), std::round(rect.bottom())));
+}
+
+void CanvasView::commitSelection(const GrayImage& shape, SelectionMode mode, const QString& name) {
+    const Document& doc = session_->doc();
+    GrayImage combined = combineSelection(doc.selection.get(), shape, mode);
+    bool empty = selectionIsEmpty(combined);
+    if (empty && !doc.selection) return;
+    auto result = empty ? nullptr : std::make_shared<GrayImage>(std::move(combined));
+    session_->edit(name, [&](Document& d) { d.selection = result; }, false);
+}
+
+void CanvasView::wandAt(QPointF d, SelectionMode mode) {
+    const Document& doc = session_->doc();
+    int x = int(std::floor(d.x())), y = int(std::floor(d.y()));
+    if (x < 0 || y < 0 || x >= doc.width || y >= doc.height) return;
+    const Layer* layer = doc.find(doc.activeLayerID);
+    bool composite = tools_->wandAllLayers || !layer || layer->isGroup || layer->isAdjustment();
+    Image source = composite ? flatten(doc) : renderLayerAlone(doc, *layer);
+    auto selected = wandSelection(source, x, y, tools_->wandTolerance, tools_->wandContiguous, 0);
+    if (!selected) return;
+    commitSelection(*selected, mode, QStringLiteral("魔棒"));
+}
+
+void CanvasView::cancelPolygon() {
+    if (!polygonActive_) return;
+    polygonActive_ = false;
+    lassoPoints_.clear();
+    update();
+}
+
+bool CanvasView::closePolygon() {
+    if (!polygonActive_) return false;
+    polygonActive_ = false;
+    std::vector<StrokePoint> points;
+    for (QPointF q : lassoPoints_) points.push_back({q.x(), q.y()});
+    lassoPoints_.clear();
+    if (points.size() < 3) { update(); return false; }
+    const Document& doc = session_->doc();
+    commitSelection(polygonSelection(doc.width, doc.height, points), selectMode_, QStringLiteral("多边形套索"));
+    update();
+    return true;
+}
+
+void CanvasView::drawSelection(QPainter& painter) {
+    const Document& doc = session_->doc();
+    QTransform view = QTransform::fromTranslate(pan_.x(), pan_.y()).scale(zoom_, zoom_);
+    auto ants = [&](const QPainterPath& path) {
+        // 黑底白虚线，虚线随计时器移动。
+        QPainterPath mapped = view.map(path);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(Qt::black, 1));
+        painter.drawPath(mapped);
+        QPen dashed(Qt::white, 1, Qt::CustomDashLine);
+        dashed.setDashPattern({4, 4});
+        dashed.setDashOffset(antsOffset_);
+        painter.setPen(dashed);
+        painter.drawPath(mapped);
+    };
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    if (doc.selection) {
+        if (antsSource_ != doc.selection.get() || antsSerial_ != doc.selection->serial) {
+            antsSource_ = doc.selection.get();
+            antsSerial_ = doc.selection->serial;
+            antsPath_ = QPainterPath();
+            std::vector<std::vector<std::pair<int, int>>> loops;
+            if (selectionOutline(*doc.selection, loops)) {
+                for (const auto& loop : loops) {
+                    if (loop.empty()) continue;
+                    antsPath_.moveTo(loop[0].first, loop[0].second);
+                    for (size_t i = 1; i < loop.size(); ++i) antsPath_.lineTo(loop[i].first, loop[i].second);
+                    antsPath_.closeSubpath();
+                }
+            } else {
+                // 轮廓太复杂：画外接框。
+                int x, y, w, h;
+                if (selectionBounds(*doc.selection, x, y, w, h)) antsPath_.addRect(x, y, w, h);
+            }
+        }
+        ants(antsPath_);
+        if (!antsTimer_.isActive()) antsTimer_.start();
+    } else if (antsTimer_.isActive()) {
+        antsTimer_.stop();
+    }
+    // 正在画的选框或套索。
+    if (drag_ == DragMode::Marquee) {
+        QRectF rect = marqueeRect(toDocument(hover_), QApplication::keyboardModifiers());
+        QPainterPath path;
+        if (tools_->marqueeEllipse) path.addEllipse(rect); else path.addRect(rect);
+        ants(path);
+    }
+    if ((drag_ == DragMode::Lasso || polygonActive_) && !lassoPoints_.empty()) {
+        QPainterPath path(lassoPoints_.front());
+        for (size_t i = 1; i < lassoPoints_.size(); ++i) path.lineTo(lassoPoints_[i]);
+        if (polygonActive_ && hover_.x() >= 0) path.lineTo(toDocument(hover_));
+        ants(path);
+        if (polygonActive_) {
+            // 起点画个小方框，点回这里就闭合。
+            QPointF first = toWidget(lassoPoints_.front());
+            painter.setPen(QPen(Qt::white, 1));
+            painter.drawRect(QRectF(first.x() - 4, first.y() - 4, 8, 8));
+        }
+    }
+    painter.restore();
 }

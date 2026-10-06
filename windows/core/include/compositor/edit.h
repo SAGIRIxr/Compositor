@@ -57,6 +57,7 @@ struct BrushSettings {
 struct StrokePoint { double x, y; };
 
 // 一笔进行中的笔触：开始时记住原像素，之后每加一个点只重算新线段覆盖到的区域。
+// 文档有选区时，笔触只作用在选区内（按覆盖度）。
 // 同一笔内的覆盖取最大值，所以笔触自身重叠处不会越描越深（与 Photoshop 的不透明度一致）。
 class BrushStroke {
 public:
@@ -79,6 +80,7 @@ private:
     ImageRef originalImage_;
     MaskRef originalMask_;
     std::vector<uint8_t> coverage_;
+    std::shared_ptr<GrayImage> selectionGrid_; // 有选区时只在选区内落墨
     int width_ = 0, height_ = 0;
     Affine pixelToDoc_, docToPixel_;
     double dirty_[4] = {1e300, 1e300, -1e300, -1e300};

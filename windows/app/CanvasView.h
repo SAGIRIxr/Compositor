@@ -4,6 +4,9 @@
 #include "ToolState.h"
 #include "compositor/edit.h"
 #include "compositor/renderer.h"
+#include "compositor/selection.h"
+#include <QPainterPath>
+#include <QTimer>
 #include <QImage>
 #include <QPointer>
 #include <QWidget>
@@ -29,6 +32,10 @@ public:
     QPointF toWidget(QPointF documentPoint) const;
     void setShowGuides(bool show) { showGuides_ = show; update(); }
     void setShowPixelGrid(bool show) { showPixelGrid_ = show; update(); }
+    // 多边形套索：取消正在画的多边形；闭合并生成选区。
+    void cancelPolygon();
+    bool closePolygon();
+    bool isDrawingPolygon() const { return polygonActive_; }
 
 signals:
     void zoomChanged(double zoom);
@@ -50,7 +57,7 @@ protected:
     void leaveEvent(QEvent*) override;
 
 private:
-    enum class DragMode { None, Pan, Paint, Move, Resize, Rotate };
+    enum class DragMode { None, Pan, Paint, Move, Resize, Rotate, Marquee, Lasso };
     void invalidate();
     void renderAll();
     void renderRegion(const QRectF& documentRect);
@@ -61,6 +68,12 @@ private:
     const comp::Layer* transformTarget() const;
     void beginPaint(QPointF documentPoint, bool shift);
     comp::LayerTransform dragged(const comp::LayerTransform& original, QPointF point, Qt::KeyboardModifiers modifiers) const;
+    // 选区
+    static comp::SelectionMode modeFor(Qt::KeyboardModifiers modifiers);
+    QRectF marqueeRect(QPointF current, Qt::KeyboardModifiers modifiers) const;
+    void commitSelection(const comp::GrayImage& shape, comp::SelectionMode mode, const QString& name);
+    void wandAt(QPointF documentPoint, comp::SelectionMode mode);
+    void drawSelection(QPainter& painter);
 
     Session* session_;
     ToolState* tools_;
@@ -70,6 +83,7 @@ private:
     QImage composite_;            // 视口大小的合成结果（物理像素）
     bool needsRender_ = true;
     bool fitted_ = false;
+    bool autoFit_ = true;         // 用户还没自己缩放平移：窗口尺寸变了就重新适配
     bool spaceHeld_ = false;
     bool showGuides_ = true;
     bool showPixelGrid_ = true;
@@ -83,4 +97,15 @@ private:
     std::optional<QPointF> lastPaintPoint_;
     QPointF hover_ = QPointF(-1, -1);
     QPixmap checker_;
+    // 选区工具的进行状态
+    comp::SelectionMode selectMode_ = comp::SelectionMode::Replace;
+    Qt::KeyboardModifiers pressModifiers_;
+    std::vector<QPointF> lassoPoints_;
+    bool polygonActive_ = false;
+    // 蚂蚁线
+    QTimer antsTimer_;
+    int antsOffset_ = 0;
+    QPainterPath antsPath_;
+    const void* antsSource_ = nullptr;
+    uint64_t antsSerial_ = 0;
 };

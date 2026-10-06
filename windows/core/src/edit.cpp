@@ -1,5 +1,6 @@
 #include "compositor/edit.h"
 #include "compositor/renderer.h"
+#include "compositor/selection.h"
 #include "compositor/uuid.h"
 #include "parallel.h"
 #include <algorithm>
@@ -358,6 +359,7 @@ bool invertMask(Document& doc, const std::string& layerID) {
 }
 
 void resizeCanvas(Document& doc, int width, int height, double anchorX, double anchorY) {
+    doc.selection.reset(); // 画布变了，选区作废
     width = std::clamp(width, 1, kMaxSide);
     height = std::clamp(height, 1, kMaxSide);
     double dx = std::round((width - doc.width) * anchorX), dy = std::round((height - doc.height) * anchorY);
@@ -371,6 +373,7 @@ void resizeCanvas(Document& doc, int width, int height, double anchorX, double a
 }
 
 void resizeImage(Document& doc, int width, int height) {
+    doc.selection.reset(); // 画布变了，选区作废
     width = std::clamp(width, 1, kMaxSide);
     height = std::clamp(height, 1, kMaxSide);
     double sx = double(width) / doc.width, sy = double(height) / doc.height;
@@ -390,6 +393,7 @@ void resizeImage(Document& doc, int width, int height) {
 }
 
 void cropCanvas(Document& doc, int x, int y, int width, int height) {
+    doc.selection.reset(); // 画布变了，选区作废
     width = std::clamp(width, 1, kMaxSide);
     height = std::clamp(height, 1, kMaxSide);
     for (auto& layer : doc.layers) {
@@ -402,6 +406,7 @@ void cropCanvas(Document& doc, int x, int y, int width, int height) {
 }
 
 void flipCanvas(Document& doc, bool horizontal) {
+    doc.selection.reset(); // 画布变了，选区作废
     auto flip = [&](LayerTransform& t) {
         if (horizontal) { t.x = doc.width - (t.x + t.width); t.flipX = !t.flipX; }
         else { t.y = doc.height - (t.y + t.height); t.flipY = !t.flipY; }
@@ -463,6 +468,7 @@ BrushStroke::BrushStroke(Document& doc, const std::string& layerID, const BrushS
     pixelToDoc_ = Affine::scale(1.0 / width_, 1.0 / height_).then(placement.unitToDocument());
     docToPixel_ = pixelToDoc_.inverted();
     coverage_.assign(size_t(width_) * size_t(height_), 0);
+    if (doc.selection) selectionGrid_ = std::make_shared<GrayImage>(selectionInLayerGrid(placement, width_, height_, *doc.selection));
     valid_ = true;
 }
 
@@ -514,6 +520,7 @@ void BrushStroke::apply(double ax, double ay, double bx, double by) {
                 // 硬边笔刷在边缘留半个像素的抗锯齿。
                 if (brush_.hardness >= 0.999) c = std::clamp(radius - d + 0.5, 0.0, 1.0);
                 size_t index = size_t(py) * size_t(width_) + size_t(px);
+                if (selectionGrid_) c *= selectionGrid_->pixels[index] / 255.0;
                 uint8_t value = uint8_t(std::lround(c * 255));
                 if (value <= coverage_[index]) continue;
                 coverage_[index] = value;

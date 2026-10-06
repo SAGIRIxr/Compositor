@@ -2,6 +2,7 @@
 #include "compositor/adjustment.h"
 #include "compositor/edit.h"
 #include "compositor/effects.h"
+#include "compositor/selection.h"
 #include "compositor/image_io.h"
 #include "compositor/project_io.h"
 #include "compositor/renderer.h"
@@ -751,4 +752,123 @@ TEST(effects_json_round_trip) {
     params[EffectKind::Stroke].present = false;
     writeEffects(params, json);
     CHECK(!json.contains("stroke"));
+}
+
+TEST(selection_shapes_and_modes) {
+    GrayImage rect = rectSelection(10, 10, 2, 2, 4, 3, false);
+    CHECK_EQ(rect.row(3)[3], 255);
+    CHECK_EQ(rect.row(1)[3], 0);
+    CHECK_EQ(rect.row(5)[3], 0);
+    int x, y, w, h;
+    CHECK(selectionBounds(rect, x, y, w, h));
+    CHECK_EQ(x, 2); CHECK_EQ(y, 2); CHECK_EQ(w, 4); CHECK_EQ(h, 3);
+    // 半像素边缘抗锯齿。
+    GrayImage half = rectSelection(4, 4, 0.5, 0, 2, 4, false);
+    CHECK_NEAR(half.row(0)[0], 128, 1);
+    CHECK_EQ(half.row(0)[1], 255);
+    GrayImage ellipse = rectSelection(20, 20, 0, 0, 20, 20, true);
+    CHECK_EQ(ellipse.row(10)[10], 255);
+    CHECK_EQ(ellipse.row(0)[0], 0);
+    GrayImage other = rectSelection(10, 10, 4, 0, 4, 10, false);
+    GrayImage added = combineSelection(&rect, other, SelectionMode::Add);
+    CHECK_EQ(added.row(8)[5], 255);
+    GrayImage subtracted = combineSelection(&rect, other, SelectionMode::Subtract);
+    CHECK_EQ(subtracted.row(3)[2], 255);
+    CHECK_EQ(subtracted.row(3)[5], 0);
+    GrayImage intersected = combineSelection(&rect, other, SelectionMode::Intersect);
+    CHECK_EQ(intersected.row(3)[5], 255);
+    CHECK_EQ(intersected.row(3)[2], 0);
+    GrayImage inverted = invertSelection(&rect, 10, 10);
+    CHECK_EQ(inverted.row(0)[0], 255);
+    CHECK_EQ(inverted.row(3)[3], 0);
+}
+
+TEST(selection_polygon_feather_grow) {
+    // 三角形：左上、右上、左下。
+    GrayImage tri = polygonSelection(10, 10, {{0, 0}, {10, 0}, {0, 10}});
+    CHECK_EQ(tri.row(1)[1], 255);
+    CHECK_EQ(tri.row(8)[8], 0);
+    CHECK(tri.row(4)[5] > 0 && tri.row(4)[5] < 255); // 斜边上的像素部分覆盖
+    GrayImage box = rectSelection(20, 20, 5, 5, 10, 10, false);
+    GrayImage grown = box;
+    growSelection(grown, 2);
+    CHECK_EQ(grown.row(10)[3], 255);
+    CHECK_EQ(grown.row(10)[2], 0);
+    GrayImage shrunk = box;
+    growSelection(shrunk, -2);
+    CHECK_EQ(shrunk.row(10)[6], 0);
+    CHECK_EQ(shrunk.row(10)[7], 255);
+    GrayImage soft = box;
+    featherSelection(soft, 4);
+    CHECK(soft.row(10)[5] > 30 && soft.row(10)[5] < 225);
+    CHECK_EQ(soft.row(10)[10], 255);
+    std::vector<std::vector<std::pair<int, int>>> loops;
+    CHECK(selectionOutline(box, loops));
+    CHECK_EQ(loops.size(), size_t(1));
+    CHECK_EQ(loops[0].size(), size_t(4));
+}
+
+TEST(selection_edits_on_transformed_layers) {
+    // 图层 2 倍像素密度：清除选区要按文档坐标对上图层像素。
+    Document doc = canvas(10, 10);
+    Layer layer = pixelLayer("l", solid(20, 20, 255, 0, 0));
+    layer.transform.width = layer.transform.height = 10;
+    doc.layers.push_back(layer);
+    GrayImage sel = rectSelection(10, 10, 0, 0, 5, 10, false);
+    CHECK(clearSelection(doc, layer.id, sel));
+    const Image& pixels = *doc.layers[0].image;
+    CHECK_EQ(pixels.at(5, 10)[3], 0);     // 左半边（文档 0–5 → 像素 0–10）被清掉
+    CHECK_EQ(pixels.at(15, 10)[3], 255);
+    const uint8_t blue[4] = {0, 0, 255, 255};
+    CHECK(fillSelection(doc, layer.id, sel, blue));
+    CHECK_EQ(doc.layers[0].image->at(5, 10)[2], 255);
+    CHECK(maskFromSelection(doc, layer.id, sel));
+    Image out = flatten(doc);
+    CHECK_EQ(out.at(2, 5)[2], 255);
+    CHECK_EQ(out.at(8, 5)[3], 0);           // 右半边被蒙版隐藏
+    // 文件夹不能填充。
+    std::string g = addGroup(doc, "g");
+    CHECK(!fillSelection(doc, g, sel, blue));
+}
+
+TEST(selection_wand_copy_crop_and_brush) {
+    Document doc = canvas(10, 10);
+    auto image = std::make_shared<Image>(10, 10);
+    image->fill(255, 255, 255, 255);
+    for (int y = 2; y < 6; ++y) for (int x = 2; x < 6; ++x) { uint8_t* p = image->at(x, y); p[0] = 0; p[1] = 0; p[2] = 0; }
+    doc.layers.push_back(pixelLayer("bg", image));
+    auto wand = wandSelection(*doc.layers[0].image, 3, 3, 10, true, 0);
+    CHECK(wand.has_value());
+    int x, y, w, h;
+    CHECK(selectionBounds(*wand, x, y, w, h));
+    CHECK_EQ(x, 2); CHECK_EQ(w, 4);
+    CHECK(!wandSelection(*image, 20, 3, 10, true, 0).has_value());
+    int ox = 0, oy = 0;
+    Image copied = copySelection(flatten(doc), *wand, ox, oy);
+    CHECK_EQ(copied.width, 4);
+    CHECK_EQ(ox, 2);
+    CHECK_EQ(copied.at(0, 0)[0], 0);
+    // 画笔只在选区内落墨。
+    doc.selection = std::make_shared<GrayImage>(*wand);
+    BrushSettings brush;
+    brush.size = 20; brush.hardness = 1;
+    const uint8_t red[4] = {255, 0, 0, 255};
+    CHECK(paintStroke(doc, doc.layers[0].id, {{5, 5}}, brush, red, false, false));
+    CHECK_EQ(doc.layers[0].image->at(3, 3)[0], 255);
+    CHECK_EQ(doc.layers[0].image->at(8, 8)[1], 255); // 选区外仍是白色
+    CHECK(cropToSelection(doc));
+    CHECK_EQ(doc.width, 4);
+    CHECK(!doc.selection);
+}
+
+TEST(content_aware_fill_uses_surroundings) {
+    // 灰色画面中间有个黑点，选中黑点做内容识别填充，结果应接近周围的灰色。
+    Document doc = canvas(32, 32);
+    auto image = std::make_shared<Image>(32, 32);
+    image->fill(128, 128, 128, 255);
+    for (int y = 14; y < 18; ++y) for (int x = 14; x < 18; ++x) { uint8_t* p = image->at(x, y); p[0] = p[1] = p[2] = 0; }
+    doc.layers.push_back(pixelLayer("bg", image));
+    GrayImage sel = rectSelection(32, 32, 13, 13, 6, 6, false);
+    CHECK_EQ(contentAwareFill(doc, doc.layers[0].id, sel), 1);
+    CHECK_NEAR(doc.layers[0].image->at(15, 15)[0], 128, 4);
 }

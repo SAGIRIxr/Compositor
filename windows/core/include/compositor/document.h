@@ -57,6 +57,8 @@ struct Document {
     std::vector<Layer> layers;        // 从下到上
     std::vector<Guide> guides;
     Json extra = Json::object();      // 清单顶层的未知字段
+    // 当前选区（文档尺寸的覆盖图），空表示没有选区。只在编辑中存在，不保存。
+    std::shared_ptr<const GrayImage> selection;
 
     double effectiveResolution() const { return resolution.value_or(72); }
     int indexOf(const std::string& layerID) const;
