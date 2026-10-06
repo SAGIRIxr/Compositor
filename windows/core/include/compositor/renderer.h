@@ -37,6 +37,9 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// 图层显示出来的像素：原像素乘上启用的蒙版（含解除链接的蒙版），尺寸与图层像素相同。
+Image shownPixels(const Layer& layer);
+
 // 便捷函数：整张画布拍平。
 Image flatten(const Document& document);
 

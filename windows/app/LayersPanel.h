@@ -36,6 +36,7 @@ public:
 
 signals:
     void editAdjustment(QString layerID);
+    void editEffects();
     void contextMenuRequested(QPoint globalPosition);
     void newLayerRequested();
     void newGroupRequested();

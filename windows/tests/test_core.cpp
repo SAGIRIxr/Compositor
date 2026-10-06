@@ -1,6 +1,7 @@
 #include "test.h"
 #include "compositor/adjustment.h"
 #include "compositor/edit.h"
+#include "compositor/effects.h"
 #include "compositor/image_io.h"
 #include "compositor/project_io.h"
 #include "compositor/renderer.h"
@@ -660,4 +661,94 @@ TEST(scaled_render_uses_mipmaps) {
     Image out = renderer.render(doc, options);
     // 棋盘格缩小后应接近 50% 灰，而不是随机的黑白点。
     for (int y = 0; y < 8; ++y) for (int x = 0; x < 8; ++x) CHECK_NEAR(out.at(x, y)[0], 128, 12);
+}
+
+namespace {
+// 20×20 画布中间一块 8×8 的白色方块，带指定效果。
+Document effectsDoc(const Json& effects) {
+    Document doc = canvas(20, 20);
+    Layer square = pixelLayer("square", solid(8, 8, 255, 255, 255), 6, 6);
+    square.extra["effects"] = effects;
+    doc.layers.push_back(square);
+    return doc;
+}
+}
+
+TEST(effects_stroke_outside_and_inside) {
+    Image out = flatten(effectsDoc(Json::parse(R"({"stroke":{"size":2,"red":1,"green":0,"blue":0,"opacity":1,"inside":false}})")));
+    CHECK_EQ(out.at(10, 10)[1], 255);          // 方块本身不变
+    CHECK_EQ(out.at(5, 10)[0], 255);           // 左边外侧 1 像素是红色描边
+    CHECK_EQ(out.at(5, 10)[1], 0);
+    CHECK_EQ(out.at(4, 10)[3], 255);           // 2 像素宽
+    CHECK_EQ(out.at(3, 10)[3], 0);
+    out = flatten(effectsDoc(Json::parse(R"({"stroke":{"size":2,"red":1,"green":0,"blue":0,"opacity":1,"inside":true}})")));
+    CHECK_EQ(out.at(6, 10)[1], 0);             // 内侧描边压在像素上
+    CHECK_EQ(out.at(10, 10)[1], 255);
+    CHECK_EQ(out.at(5, 10)[3], 0);
+}
+
+TEST(effects_drop_shadow_falls_away_from_light) {
+    // 光从正上方（90°）来，阴影向下 4 像素，不模糊。
+    Image out = flatten(effectsDoc(Json::parse(R"({"shadow":{"angle":90,"distance":4,"blur":0,"red":0,"green":0,"blue":0,"opacity":1}})")));
+    CHECK_EQ(out.at(10, 15)[3], 255);          // 方块下方是阴影
+    CHECK_EQ(out.at(10, 15)[0], 0);
+    CHECK_EQ(out.at(10, 4)[3], 0);             // 上方没有
+    CHECK_EQ(out.at(10, 10)[0], 255);          // 方块盖在阴影上
+}
+
+TEST(effects_overlay_glow_and_disabled) {
+    Image out = flatten(effectsDoc(Json::parse(R"({"colorOverlay":{"red":0,"green":0,"blue":1,"opacity":1}})")));
+    CHECK_EQ(out.at(10, 10)[0], 0);
+    CHECK_EQ(out.at(10, 10)[2], 255);
+    CHECK_EQ(out.at(2, 2)[3], 0);
+    out = flatten(effectsDoc(Json::parse(R"({"colorOverlay":{"enabled":false,"red":0,"green":0,"blue":1,"opacity":1}})")));
+    CHECK_EQ(out.at(10, 10)[0], 255);          // 隐藏的效果不画
+    out = flatten(effectsDoc(Json::parse(R"({"outerGlow":{"size":6,"red":1,"green":1,"blue":0,"opacity":1}})")));
+    CHECK(out.at(5, 10)[3] > 0);               // 外面有光晕
+    CHECK(out.at(5, 10)[3] < 255);
+    CHECK_EQ(out.at(10, 10)[2], 255);          // 里面不受影响
+    out = flatten(effectsDoc(Json::parse(R"({"innerShadow":{"angle":90,"distance":3,"blur":0,"red":0,"green":0,"blue":0,"opacity":1}})")));
+    CHECK_EQ(out.at(10, 6)[0], 0);             // 上边缘内侧变暗
+    CHECK_EQ(out.at(10, 12)[0], 255);
+}
+
+TEST(effects_follow_layer_transform_and_mask) {
+    // 缩放 2 倍的图层：效果按图层像素计算，放大后描边也是 2 倍宽。
+    Document doc = canvas(40, 40);
+    Layer square = pixelLayer("s", solid(8, 8, 255, 255, 255), 12, 12);
+    square.transform.width = square.transform.height = 16;
+    square.extra["effects"] = Json::parse(R"({"stroke":{"size":2,"red":1,"green":0,"blue":0,"opacity":1,"inside":false}})");
+    doc.layers.push_back(square);
+    Image out = flatten(doc);
+    CHECK_EQ(out.at(20, 20)[1], 255);
+    CHECK_EQ(out.at(9, 20)[0], 255);
+    CHECK_EQ(out.at(9, 20)[1], 0);
+    CHECK_EQ(out.at(6, 20)[3], 0);             // 放大插值只柔化描边外缘的一个像素
+    // 蒙版隐藏右半边：描边沿显示出来的形状走，右半边的像素也不出现。
+    auto mask = std::make_shared<GrayImage>(2, 1);
+    mask->pixels = {255, 0};
+    doc.layers[0].mask = mask;
+    out = flatten(doc);
+    CHECK_EQ(out.at(14, 20)[1], 255);
+    CHECK_EQ(out.at(26, 20)[1], 0);
+}
+
+TEST(effects_json_round_trip) {
+    const double gray[3] = {0.5, 0.5, 0.5};
+    LayerEffectsParams params;
+    for (EffectKind kind : allEffectKinds()) params[kind] = defaultEffect(kind, gray);
+    params[EffectKind::Shadow].enabled = false;
+    Json json = Json::parse(R"({"futureEffect":{"x":1}})");
+    writeEffects(params, json);
+    CHECK(json.contains("futureEffect"));
+    CHECK_EQ(json["shadow"]["enabled"].get<bool>(), false);
+    CHECK(!json["stroke"].contains("enabled"));
+    LayerEffectsParams again = parseEffects(json);
+    CHECK(again.isValid());
+    CHECK(!again[EffectKind::Shadow].enabled);
+    CHECK_NEAR(again[EffectKind::Stroke].color[0], 0.5, 1e-9);
+    CHECK_NEAR(again[EffectKind::OuterGlow].size, 20, 1e-9);
+    params[EffectKind::Stroke].present = false;
+    writeEffects(params, json);
+    CHECK(!json.contains("stroke"));
 }

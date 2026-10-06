@@ -13,6 +13,7 @@ add_library(compositor_ui STATIC
     MainWindow.cpp MainWindow.h
     Dialogs.cpp Dialogs.h
     AdjustmentDialog.cpp AdjustmentDialog.h
+    EffectsDialog.cpp EffectsDialog.h
     CurveEditor.cpp CurveEditor.h
     ToolState.h
 )

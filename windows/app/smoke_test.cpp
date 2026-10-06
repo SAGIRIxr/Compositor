@@ -1,5 +1,6 @@
 // 界面冒烟测试：启动主窗口，走一遍新建、画笔、图层、调整层、撤销、保存、外部改写重载与导出。
 #include "CanvasView.h"
+#include "EffectsDialog.h"
 #include "LayersPanel.h"
 #include "MainWindow.h"
 #include "QtBridge.h"
@@ -16,6 +17,9 @@
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTreeWidget>
+#include <QListWidget>
+#include <QDialogButtonBox>
+#include <QPushButton>
 #include <iostream>
 
 using namespace comp;
@@ -90,6 +94,34 @@ int main(int argc, char** argv) {
     drag(canvas, canvas->toWidget(QPointF(200, 150)).toPoint(), canvas->toWidget(QPointF(200, 200)).toPoint());
     layer = session->doc().find(painted);
     EXPECT(layer && std::abs(layer->transform.y - 50) <= 2);
+
+    // 图层效果：勾选描边后取消，不留痕迹；再勾选后确定，写进图层并可撤销。
+    session->setActiveLayer(painted);
+    action(window, QStringLiteral("effects"))->trigger();
+    auto* effects = window.findChild<EffectsDialog*>();
+    EXPECT(effects != nullptr);
+    if (effects) {
+        auto* list = effects->findChild<QListWidget*>();
+        list->item(0)->setCheckState(Qt::Checked);
+        EXPECT(session->doc().find(painted)->extra.contains("effects"));
+        effects->reject();
+        QTest::qWait(20);
+        EXPECT(!session->doc().find(painted)->extra.contains("effects"));
+    }
+    action(window, QStringLiteral("effects"))->trigger();
+    QTest::qWait(20);
+    effects = nullptr;
+    for (auto* d : window.findChildren<EffectsDialog*>()) if (d->isVisible()) effects = d;
+    if (effects) {
+        effects->findChild<QListWidget*>()->item(0)->setCheckState(Qt::Checked);
+        effects->accept();
+        QTest::qWait(20);
+    }
+    EXPECT(session->doc().find(painted)->extra["effects"].contains("stroke"));
+    action(window, QStringLiteral("undo"))->trigger();
+    EXPECT(!session->doc().find(painted)->extra.contains("effects"));
+    action(window, QStringLiteral("redo"))->trigger();
+    EXPECT(session->doc().find(painted)->extra.contains("effects"));
 
     // 反相调整层（无参数，不弹编辑框）。
     action(window, QStringLiteral("adjust_Invert"))->trigger();

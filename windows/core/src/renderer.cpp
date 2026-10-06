@@ -1,5 +1,6 @@
 #include "compositor/renderer.h"
 #include "compositor/adjustment.h"
+#include "compositor/effects.h"
 #include "compositor/image_io.h"
 #include "parallel.h"
 #include <algorithm>
@@ -82,6 +83,35 @@ PlacedMask placeMask(const RenderOptions& o, const GrayImage* mask, const LayerT
 
 } // namespace
 
+// 图层显示出来的像素：原像素乘上蒙版（链接的蒙版拉伸覆盖图层，解除链接的按它自己的位置取样）。
+Image shownPixels(const Layer& l) {
+    Image out = *l.image;
+    if (!l.mask || !l.maskEnabled) return out;
+    const GrayImage& mask = *l.mask;
+    int uniform = mask.uniformValue();
+    bool placed = l.maskPlacement && !l.maskLinked && !l.maskPlacement->samePlacement(l.transform);
+    Affine toMask;
+    if (placed) {
+        // 图层像素 → 单位方块 → 文档 → 蒙版的单位方块 → 蒙版像素。
+        toMask = Affine::scale(1.0 / out.width, 1.0 / out.height).then(l.transform.unitToDocument())
+            .then(l.maskPlacement->unitToDocument().inverted()).then(Affine{double(mask.width), 0, 0, double(mask.height), -0.5, -0.5});
+    } else {
+        toMask = Affine::scale(double(mask.width) / out.width, double(mask.height) / out.height).then(Affine::translate(-0.5, -0.5));
+    }
+    parallelRanges(out.height, [&](int begin, int end) {
+        for (int y = begin; y < end; ++y) {
+            uint8_t* row = out.row(y);
+            for (int x = 0; x < out.width; ++x) {
+                float m;
+                if (uniform >= 0) m = uniform / 255.0f;
+                else { double mx, my; toMask.apply(x + 0.5, y + 0.5, mx, my); m = sampleGrayClamp(mask, mx, my); }
+                for (int k = 0; k < 4; ++k) row[x * 4 + k] = uint8_t(std::lround(row[x * 4 + k] * m));
+            }
+        }
+    });
+    return out;
+}
+
 struct Renderer::Impl {
     std::mutex mutex;
     struct Entry { std::vector<std::shared_ptr<Image>> levels; uint64_t lastUse = 0; };
@@ -103,6 +133,41 @@ struct Renderer::Impl {
         return *entry.levels[size_t(std::min<int>(level, int(entry.levels.size())) - 1)];
     }
 
+    // 带效果的图层图：按像素、蒙版与效果参数缓存，画布每次重绘不必重算。
+    struct FxEntry { uint64_t image = 0, mask = 0; std::string key; EffectsImage fx; uint64_t lastUse = 0; };
+    std::vector<FxEntry> fx;
+
+    std::optional<EffectsImage> effects(const Layer& l) {
+        auto found = l.extra.find("effects");
+        if (found == l.extra.end() || !l.image) return std::nullopt;
+        LayerEffectsParams params;
+        try { params = parseEffects(*found); } catch (...) { return std::nullopt; }
+        if (!params.anyVisible() || !params.isValid()) return std::nullopt;
+        bool masked = l.mask && l.maskEnabled;
+        std::string key = found->dump();
+        if (masked && l.maskPlacement && !l.maskLinked) key += Json{l.maskPlacement->x, l.maskPlacement->y, l.maskPlacement->width,
+            l.maskPlacement->height, l.maskPlacement->rotation, l.maskPlacement->flipX, l.maskPlacement->flipY,
+            l.transform.x, l.transform.y, l.transform.width, l.transform.height, l.transform.rotation}.dump();
+        uint64_t maskSerial = masked ? l.mask->serial : 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto& e : fx) {
+                if (e.image == l.image->serial && e.mask == maskSerial && e.key == key) { e.lastUse = generation; return e.fx; }
+            }
+        }
+        EffectsImage made = renderEffects(masked ? shownPixels(l) : *l.image, params);
+        if (!made.image) return std::nullopt;
+        std::lock_guard<std::mutex> lock(mutex);
+        fx.push_back({l.image->serial, maskSerial, key, made, generation});
+        size_t bytes = 0;
+        for (const auto& e : fx) bytes += e.fx.image->pixels.size();
+        while (fx.size() > 1 && (fx.size() > 12 || bytes > (size_t(256) << 20))) {
+            bytes -= fx.front().fx.image->pixels.size();
+            fx.erase(fx.begin());
+        }
+        return made;
+    }
+
     void beginRender() {
         std::lock_guard<std::mutex> lock(mutex);
         ++generation;
@@ -110,6 +175,7 @@ struct Renderer::Impl {
         for (auto it = mips.begin(); it != mips.end();) {
             if (generation - it->second.lastUse > 3) it = mips.erase(it); else ++it;
         }
+        fx.erase(std::remove_if(fx.begin(), fx.end(), [&](const FxEntry& e) { return generation - e.lastUse > 6; }), fx.end());
     }
 };
 
@@ -153,25 +219,33 @@ struct Pass {
         if (!l.image || l.image->empty()) return;
         double opacity = ignoreOpacity ? 1.0 : doc.effectiveOpacity(l);
         if (opacity <= 0) return;
-        const LayerTransform& t = l.transform;
+        // 有图层效果时画带效果的放大图：蒙版已经乘进去了，变换按边距同比例放大。
+        ImageRef pixels = l.image;
+        LayerTransform t = l.transform;
+        bool useMask = true;
+        if (auto fx = impl.effects(l)) {
+            pixels = fx->image;
+            t = grownTransform(l.transform, fx->image->width, fx->image->height, fx->inset);
+            useMask = false;
+        }
         // 输出像素中心 → 原图像素坐标，用来估计缩小倍数。
-        Affine toImage = Affine::translate(0.5, 0.5).then(outputToGrid(options, t, l.image->width, l.image->height));
+        Affine toImage = Affine::translate(0.5, 0.5).then(outputToGrid(options, t, pixels->width, pixels->height));
         double ratio = std::sqrt(std::abs(toImage.a * toImage.d - toImage.b * toImage.c));
         int level = 0;
         if (t.sampling != Sampling::Nearest) {
             while (ratio >= 2 && level < 16) { ratio /= 2; ++level; }
         }
-        const Image& source = impl.level(l.image, level);
+        const Image& source = impl.level(pixels, level);
         double factor = std::ldexp(1.0, -level);
         Affine toSource = Affine::translate(0.5, 0.5).then(
-            outputToGrid(options, t, l.image->width * factor, l.image->height * factor));
+            outputToGrid(options, t, pixels->width * factor, pixels->height * factor));
         bool nearest = t.sampling == Sampling::Nearest;
         // 1:1 且无旋转时直接取像素，不做插值。
         bool exact = std::abs(toSource.a - 1) < 1e-9 && std::abs(toSource.d - 1) < 1e-9 && toSource.b == 0 && toSource.c == 0
             && std::abs(toSource.tx - std::round(toSource.tx)) < 1e-6 && std::abs(toSource.ty - std::round(toSource.ty)) < 1e-6;
 
         std::optional<PlacedMask> ownMask;
-        if (l.mask && l.mask->width > 0 && l.maskEnabled) {
+        if (useMask && l.mask && l.mask->width > 0 && l.maskEnabled) {
             bool placed = l.maskPlacement && !l.maskLinked && !l.maskPlacement->samePlacement(t);
             ownMask = placeMask(options, l.mask.get(), placed ? *l.maskPlacement : t, false);
             if (!placed) {

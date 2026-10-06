@@ -62,6 +62,7 @@ private:
     void canvasSize();
     void imageSize();
     void editAdjustment(const QString& layerID);
+    void editEffects();
     void addAdjustment(int kind);
     void showAbout();
 

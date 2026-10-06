@@ -115,7 +115,7 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
     tree_->header()->setStretchLastSection(false);
     tree_->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     tree_->header()->setSectionResizeMode(1, QHeaderView::Fixed);
-    tree_->header()->resizeSection(1, kThumb + 8);
+    tree_->header()->resizeSection(1, kThumb + 30);
     tree_->setIconSize(QSize(kThumb, kThumb));
     tree_->setDragDropMode(QAbstractItemView::InternalMove);
     tree_->setDefaultDropAction(Qt::MoveAction);
@@ -185,6 +185,7 @@ LayersPanel::LayersPanel(QWidget* parent) : QWidget(parent) {
         QString id = item->data(0, kIDRole).toString();
         const Layer* layer = session_->doc().find(id.toStdString());
         if (layer && layer->isAdjustment() && column == 0) emit editAdjustment(id);
+        else if (column == 1 && layer && layer->extra.contains("effects")) emit editEffects();
         else if (column == 0) tree_->editItem(item, 0);
     });
     connect(tree_, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem* item) { collapsed_.remove(item->data(0, kIDRole).toString()); });
@@ -321,10 +322,15 @@ void LayersPanel::rebuild() {
             if (layer.blendMode != BlendMode::Normal) notes << QString::fromUtf8(blendModeName(layer.blendMode));
             if (layer.opacity < 1) notes << QStringLiteral("%1%").arg(int(std::lround(layer.opacity * 100)));
             if (layer.hasText()) notes << QStringLiteral("文字（以像素显示）");
-            if (layer.extra.contains("effects")) notes << QStringLiteral("图层效果（保留，暂不显示）");
+            if (layer.extra.contains("effects")) notes << QStringLiteral("图层效果");
             if (layer.isAdjustment()) notes << QStringLiteral("双击编辑");
             item->setToolTip(0, notes.isEmpty() ? name : name + QStringLiteral("\n") + notes.join(QStringLiteral("，")));
             if (!layer.maskSourceID.empty()) item->setText(0, QStringLiteral("↳ ") + name);
+            // 有图层效果时在右侧标 fx（名字列要留给重命名，不往里加字）。
+            if (layer.extra.contains("effects")) {
+                item->setText(1, QStringLiteral("fx"));
+                item->setToolTip(1, QStringLiteral("图层效果：双击这里编辑"));
+            }
             if (!doc.isEffectivelyVisible(layer)) item->setForeground(0, QColor(140, 140, 140));
             if (layer.id == doc.activeLayerID) current = item;
             if (layer.isGroup) {

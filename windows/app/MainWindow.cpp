@@ -2,6 +2,7 @@
 #include "AdjustmentDialog.h"
 #include "CanvasView.h"
 #include "Dialogs.h"
+#include "EffectsDialog.h"
 #include "LayersPanel.h"
 #include "QtBridge.h"
 #include "Session.h"
@@ -172,6 +173,10 @@ void MainWindow::createActions() {
     add("invertMask", QStringLiteral("反相蒙版"), QKeySequence(), [this] { editCurrent(QStringLiteral("反相蒙版"), [](Document& d) { invertMask(d, d.activeLayerID); }); });
     add("applyMask", QStringLiteral("应用蒙版"), QKeySequence(), [this] { editCurrent(QStringLiteral("应用蒙版"), [](Document& d) { applyMask(d, d.activeLayerID); }); });
     add("deleteMask", QStringLiteral("删除蒙版"), QKeySequence(), [this] { editCurrent(QStringLiteral("删除蒙版"), [](Document& d) { deleteMask(d, d.activeLayerID); }); });
+    add("effects", QStringLiteral("图层效果…"), QKeySequence(QStringLiteral("Ctrl+Shift+F")), [this] { editEffects(); });
+    add("clearEffects", QStringLiteral("清除图层效果"), QKeySequence(), [this] {
+        editCurrent(QStringLiteral("清除图层效果"), [](Document& d) { if (Layer* l = d.find(d.activeLayerID)) l->extra.erase("effects"); });
+    });
     add("editAdjustment", QStringLiteral("编辑调整…"), QKeySequence(), [this] {
         if (Session* s = currentSession()) editAdjustment(QString::fromStdString(s->doc().activeLayerID));
     });
@@ -286,6 +291,8 @@ void MainWindow::createMenus() {
     layer->addSeparator();
     QMenu* mask = layer->addMenu(QStringLiteral("图层蒙版"));
     for (const char* key : {"addMask", "addMaskHide", "toggleMask", "invertMask", "applyMask", "deleteMask"}) mask->addAction(actions_[key]);
+    layer->addAction(actions_["effects"]);
+    layer->addAction(actions_["clearEffects"]);
     layer->addAction(actions_["editAdjustment"]);
 
     QMenu* view = menuBar()->addMenu(QStringLiteral("视图(&V)"));
@@ -305,6 +312,8 @@ void MainWindow::createMenus() {
     layerContextMenu_->addSeparator();
     for (const char* key : {"addMask", "toggleMask", "invertMask", "applyMask", "deleteMask"}) layerContextMenu_->addAction(actions_[key]);
     layerContextMenu_->addSeparator();
+    layerContextMenu_->addAction(actions_["effects"]);
+    layerContextMenu_->addAction(actions_["clearEffects"]);
     layerContextMenu_->addAction(actions_["editAdjustment"]);
     layerContextMenu_->addMenu(adjustmentMenu_);
 }
@@ -380,6 +389,7 @@ void MainWindow::createDocks() {
     dock->setMinimumWidth(280);
     addDockWidget(Qt::RightDockWidgetArea, dock);
     connect(layers_, &LayersPanel::editAdjustment, this, [this](const QString& id) { editAdjustment(id); });
+    connect(layers_, &LayersPanel::editEffects, this, [this] { editEffects(); });
     connect(layers_, &LayersPanel::contextMenuRequested, this, [this](QPoint p) { updateActions(); layerContextMenu_->popup(p); });
     connect(layers_, &LayersPanel::newLayerRequested, actions_["newLayer"], &QAction::trigger);
     connect(layers_, &LayersPanel::newGroupRequested, actions_["newGroup"], &QAction::trigger);
@@ -458,6 +468,9 @@ void MainWindow::updateActions() {
     for (const char* key : {"duplicate", "delete", "groupLayer", "raise", "lower"}) actions_[key]->setEnabled(layer);
     bool pixel = layer && !layer->isGroup && !layer->isAdjustment();
     for (const char* key : {"copy", "mergeDown", "flipLayerH", "flipLayerV", "fill"}) actions_[key]->setEnabled(pixel);
+    // 图层效果画在像素周围，所以只给有像素的图层（与 macOS 版一致）。
+    actions_["effects"]->setEnabled(pixel && layer->image);
+    actions_["clearEffects"]->setEnabled(layer && layer->extra.contains("effects"));
     actions_["clip"]->setEnabled(layer && !layer->isGroup);
     actions_["addMask"]->setEnabled(layer && !layer->mask);
     actions_["addMaskHide"]->setEnabled(layer && !layer->mask);
@@ -744,6 +757,20 @@ void MainWindow::editAdjustment(const QString& layerID) {
     } catch (const std::exception& e) {
         showError(QStringLiteral("无法编辑"), QString::fromUtf8(e.what()));
     }
+}
+
+void MainWindow::editEffects() {
+    Session* s = currentSession();
+    if (!s || s->isPreviewing()) return;
+    const Layer* layer = s->doc().find(s->doc().activeLayerID);
+    if (!layer || !layer->image || layer->isGroup || layer->isAdjustment()) {
+        statusBar()->showMessage(QStringLiteral("图层效果需要有像素的图层；空白图层先画点东西。"), 4000);
+        return;
+    }
+    auto* dialog = new EffectsDialog(s, layer->id, tools_.background, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowModality(Qt::WindowModal);
+    dialog->show();
 }
 
 void MainWindow::addAdjustment(int kind) {

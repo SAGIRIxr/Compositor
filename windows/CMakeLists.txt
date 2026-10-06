@@ -40,6 +40,7 @@ add_library(compositor_core STATIC
     core/src/blend.cpp
     core/src/document.cpp
     core/src/edit.cpp
+    core/src/effects.cpp
     core/src/image.cpp
     core/src/image_io.cpp
     core/src/project_io.cpp
