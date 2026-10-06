@@ -382,6 +382,9 @@ void MainWindow::createToolBars() {
         {Tool::Wand, "魔棒", "W", "魔棒工具（W）：选取相近的颜色"},
         {Tool::Brush, "画笔", "B", "画笔工具（B）：Shift 点击画直线，[ ] 调整大小"},
         {Tool::Eraser, "橡皮", "E", "橡皮擦工具（E）"},
+        {Tool::Heal, "修复", "J", "污点修复画笔（J）：涂抹瑕疵，松开后用周围的纹理修补"},
+        {Tool::Clone, "仿制", "S", "仿制图章（S）：按住 Alt 点击设置取样点，再在别处涂抹"},
+        {Tool::Gradient, "渐变", "G", "渐变工具（G）：拖出渐变，Shift 约束角度；有选区时只填选区"},
         {Tool::Eyedropper, "吸管", "I", "吸管工具（I）：点击取前景色，Alt 点击取背景色"},
         {Tool::Hand, "抓手", "H", "抓手工具（H）：拖动画布；任何工具下按住空格也可以"},
         {Tool::Zoom, "缩放", "Z", "缩放工具（Z）：点击放大，Alt 点击缩小"},
@@ -427,7 +430,9 @@ void MainWindow::createToolBars() {
     brushSize_ = spin(QStringLiteral("大小"), 1, 5000, int(tools_.brush.size), QStringLiteral(" 像素"));
     brushHardness_ = spin(QStringLiteral("硬度"), 0, 100, int(tools_.brush.hardness * 100), QStringLiteral("%"));
     brushOpacity_ = spin(QStringLiteral("不透明度"), 1, 100, int(tools_.brush.opacity * 100), QStringLiteral("%"));
-    for (int i = before; i < options->actions().size(); ++i) { track(Tool::Brush, options->actions()[i]); track(Tool::Eraser, options->actions()[i]); }
+    for (int i = before; i < options->actions().size(); ++i) {
+        for (Tool t : {Tool::Brush, Tool::Eraser, Tool::Heal, Tool::Clone}) track(t, options->actions()[i]);
+    }
     connect(brushSize_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) { tools_.brush.size = v; tools_.notify(); });
     connect(brushHardness_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) { tools_.brush.hardness = v / 100.0; tools_.notify(); });
     connect(brushOpacity_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) { tools_.brush.opacity = v / 100.0; tools_.notify(); });
@@ -458,6 +463,40 @@ void MainWindow::createToolBars() {
     auto* allLayers = new QCheckBox(QStringLiteral("对所有图层取样"));
     track(Tool::Wand, options->addWidget(allLayers));
     connect(allLayers, &QCheckBox::toggled, this, [this](bool on) { tools_.wandAllLayers = on; });
+    // 污点修复
+    track(Tool::Heal, label(QStringLiteral("类型")));
+    auto* healMode = new QComboBox;
+    healMode->addItems({QStringLiteral("内容识别"), QStringLiteral("创建纹理"), QStringLiteral("近似匹配")});
+    track(Tool::Heal, options->addWidget(healMode));
+    connect(healMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) { tools_.healMode = i; });
+    // 仿制图章
+    auto* aligned = new QCheckBox(QStringLiteral("对齐"));
+    aligned->setChecked(tools_.cloneAligned);
+    track(Tool::Clone, options->addWidget(aligned));
+    connect(aligned, &QCheckBox::toggled, this, [this](bool on) { tools_.cloneAligned = on; tools_.cloneOffset.reset(); });
+    auto* cloneAll = new QCheckBox(QStringLiteral("对所有图层取样"));
+    track(Tool::Clone, options->addWidget(cloneAll));
+    connect(cloneAll, &QCheckBox::toggled, this, [this](bool on) { tools_.cloneAllLayers = on; });
+    track(Tool::Clone, label(QStringLiteral("<span style='color:gray'>Alt 点击设置取样点</span>")));
+    // 渐变
+    track(Tool::Gradient, label(QStringLiteral("形状")));
+    auto* gradientShape = new QComboBox;
+    gradientShape->addItems({QStringLiteral("线性"), QStringLiteral("径向")});
+    track(Tool::Gradient, options->addWidget(gradientShape));
+    connect(gradientShape, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) { tools_.gradientRadial = i == 1; });
+    auto* gradientStyle = new QComboBox;
+    gradientStyle->addItems({QStringLiteral("前景色到背景色"), QStringLiteral("前景色到透明")});
+    track(Tool::Gradient, options->addWidget(gradientStyle));
+    connect(gradientStyle, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int i) { tools_.gradientToTransparent = i == 1; });
+    auto* gradientReverse = new QCheckBox(QStringLiteral("反向"));
+    track(Tool::Gradient, options->addWidget(gradientReverse));
+    connect(gradientReverse, &QCheckBox::toggled, this, [this](bool on) { tools_.gradientReversed = on; });
+    {
+        int start = options->actions().size();
+        QSpinBox* gradientOpacity = spin(QStringLiteral("不透明度"), 1, 100, 100, QStringLiteral("%"));
+        for (int i = start; i < options->actions().size(); ++i) track(Tool::Gradient, options->actions()[i]);
+        connect(gradientOpacity, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) { tools_.gradientOpacity = v / 100.0; });
+    }
     // 选区工具共用的提示。
     QAction* hint = label(QStringLiteral("<span style='color:gray'>Shift 添加 · Alt 减去 · Shift+Alt 交叉</span>"));
     for (Tool t : {Tool::Marquee, Tool::Lasso, Tool::Wand}) track(t, hint);

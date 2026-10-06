@@ -872,3 +872,94 @@ TEST(content_aware_fill_uses_surroundings) {
     CHECK_EQ(contentAwareFill(doc, doc.layers[0].id, sel), 1);
     CHECK_NEAR(doc.layers[0].image->at(15, 15)[0], 128, 4);
 }
+
+TEST(clone_stamp_copies_from_offset) {
+    // 左半红右半蓝，从右边（+10 像素）取样画在左边。
+    Document doc = canvas(20, 10);
+    auto image = std::make_shared<Image>(20, 10);
+    for (int y = 0; y < 10; ++y) for (int x = 0; x < 20; ++x) {
+        uint8_t* p = image->at(x, y);
+        p[0] = x < 10 ? 255 : 0; p[1] = 0; p[2] = x < 10 ? 0 : 255; p[3] = 255;
+    }
+    doc.layers.push_back(pixelLayer("bg", image));
+    BrushSettings brush;
+    brush.size = 4; brush.hardness = 1;
+    StrokeOptions options;
+    options.kind = StrokeKind::Clone;
+    options.cloneOffsetX = 10;
+    const uint8_t none[4] = {0, 0, 0, 255};
+    BrushStroke stroke(doc, doc.layers[0].id, brush, none, options, false);
+    CHECK(stroke.isValid());
+    stroke.addPoint(5, 5);
+    CHECK(stroke.finish());
+    CHECK_EQ(doc.layers[0].image->at(5, 5)[2], 255);
+    CHECK_EQ(doc.layers[0].image->at(5, 5)[0], 0);
+    CHECK_EQ(doc.layers[0].image->at(1, 5)[0], 255); // 笔刷外不变
+    // 对所有图层取样：从合成图取。
+    Document doc2 = doc;
+    options.cloneSource = std::make_shared<Image>(flatten(doc2));
+    options.cloneOffsetX = -10;
+    BrushStroke back(doc2, doc2.layers[0].id, brush, none, options, false);
+    back.addPoint(18, 5);                              // 从 x=8 取样（第一笔没碰到的红色）
+    back.finish();
+    CHECK_EQ(doc2.layers[0].image->at(18, 5)[0], 255);
+    // 仿制不能画在蒙版上。
+    addMask(doc, doc.layers[0].id, true);
+    BrushStroke onMask(doc, doc.layers[0].id, brush, none, options, true);
+    CHECK(!onMask.isValid());
+}
+
+TEST(spot_heal_removes_blemish) {
+    Document doc = canvas(64, 64);
+    auto image = std::make_shared<Image>(64, 64);
+    image->fill(120, 140, 160, 255);
+    for (int y = 30; y < 34; ++y) for (int x = 30; x < 34; ++x) { uint8_t* p = image->at(x, y); p[0] = p[1] = p[2] = 0; }
+    doc.layers.push_back(pixelLayer("bg", image));
+    BrushSettings brush;
+    brush.size = 10; brush.hardness = 0.5;
+    StrokeOptions options;
+    options.kind = StrokeKind::Heal;
+    options.seed = 7;
+    const uint8_t none[4] = {0, 0, 0, 255};
+    BrushStroke stroke(doc, doc.layers[0].id, brush, none, options, false);
+    stroke.addPoint(31.5, 31.5);
+    CHECK(doc.layers[0].image->at(20, 31)[0] == 120);   // 预览只动笔刷范围
+    CHECK(stroke.finish());
+    const uint8_t* healed = doc.layers[0].image->at(31, 31);
+    CHECK_NEAR(healed[0], 120, 12);
+    CHECK_NEAR(healed[2], 160, 12);
+}
+
+TEST(gradient_linear_radial_selection_and_mask) {
+    Document doc = newDocument(11, 3, nullptr);
+    std::string id = doc.activeLayerID;
+    const uint8_t black[4] = {0, 0, 0, 255}, white[4] = {255, 255, 255, 255};
+    GradientSettings settings;
+    CHECK(drawGradient(doc, id, 0.5, 1, 10.5, 1, black, white, settings, false));
+    const Image& g = *doc.find(id)->image;
+    CHECK_EQ(g.at(0, 1)[0], 0);
+    CHECK_NEAR(g.at(5, 1)[0], 128, 1);
+    CHECK_EQ(g.at(10, 1)[0], 255);
+    CHECK_EQ(g.at(5, 1)[3], 255);
+    // 径向：中心是起始色。
+    settings.radial = true;
+    CHECK(drawGradient(doc, id, 5.5, 1.5, 10.5, 1.5, white, black, settings, false));
+    CHECK_EQ(doc.find(id)->image->at(5, 1)[0], 255);
+    CHECK(doc.find(id)->image->at(9, 1)[0] < 80);
+    // 选区限制：只有左边几列变。
+    settings.radial = false;
+    doc.selection = std::make_shared<GrayImage>(rectSelection(11, 3, 0, 0, 3, 3, false));
+    const uint8_t red[4] = {255, 0, 0, 255};
+    CHECK(drawGradient(doc, id, 0, 0, 11, 0, red, red, settings, false));
+    CHECK_EQ(doc.find(id)->image->at(1, 1)[1], 0);
+    CHECK(doc.find(id)->image->at(8, 1)[1] > 0);
+    doc.selection.reset();
+    // 蒙版上：从黑到白。
+    addMask(doc, id, true);
+    CHECK(drawGradient(doc, id, 0.5, 1, 10.5, 1, black, white, settings, true));
+    CHECK_EQ(doc.find(id)->mask->width, 11);
+    CHECK_EQ(doc.find(id)->mask->row(1)[0], 0);
+    CHECK_EQ(doc.find(id)->mask->row(1)[10], 255);
+    // 太短的线不画。
+    CHECK(!drawGradient(doc, id, 1, 1, 1.2, 1, black, white, settings, false));
+}

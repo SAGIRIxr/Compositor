@@ -1,6 +1,10 @@
 #include "compositor/edit.h"
 #include "compositor/renderer.h"
 #include "compositor/selection.h"
+
+extern "C" {
+#include "HealPixels.h"
+}
 #include "compositor/uuid.h"
 #include "parallel.h"
 #include <algorithm>
@@ -50,6 +54,21 @@ void maskSize(const Layer& layer, int& w, int& h) {
 }
 
 void shiftTransform(LayerTransform& t, double dx, double dy) { t.x += dx; t.y += dy; }
+
+// 预乘图像双线性取样，越界为透明。
+void sampleImage(const Image& image, double x, double y, float out[4]) {
+    int x0 = int(std::floor(x)), y0 = int(std::floor(y));
+    float fx = float(x - x0), fy = float(y - y0);
+    auto at = [&](int px, int py, int k) -> float {
+        if (px < 0 || py < 0 || px >= image.width || py >= image.height) return 0;
+        return image.at(px, py)[k];
+    };
+    for (int k = 0; k < 4; ++k) {
+        float top = at(x0, y0, k) * (1 - fx) + at(x0 + 1, y0, k) * fx;
+        float bottom = at(x0, y0 + 1, k) * (1 - fx) + at(x0 + 1, y0 + 1, k) * fx;
+        out[k] = top * (1 - fy) + bottom * fy;
+    }
+}
 
 } // namespace
 
@@ -433,6 +452,21 @@ BrushStroke::BrushStroke(Document& doc, const std::string& layerID, const BrushS
                          const uint8_t color[4], bool erase, bool onMask)
     : layerID_(layerID), brush_(brush), erase_(erase), onMask_(onMask) {
     std::copy(color, color + 4, color_);
+    options_.kind = erase ? StrokeKind::Erase : StrokeKind::Paint;
+    init(doc, layerID, onMask);
+}
+
+BrushStroke::BrushStroke(Document& doc, const std::string& layerID, const BrushSettings& brush,
+                         const uint8_t color[4], const StrokeOptions& options, bool onMask)
+    : layerID_(layerID), brush_(brush), erase_(options.kind == StrokeKind::Erase), onMask_(onMask) {
+    options_ = options;
+    std::copy(color, color + 4, color_);
+    if (onMask && (options.kind == StrokeKind::Clone || options.kind == StrokeKind::Heal)) return;
+    init(doc, layerID, onMask);
+}
+
+void BrushStroke::init(Document& doc, const std::string& layerID, bool onMask) {
+
     Layer* layer = doc.find(layerID);
     if (!layer) return;
     if (onMask) {
@@ -525,7 +559,29 @@ void BrushStroke::apply(double ax, double ay, double bx, double by) {
                 if (value <= coverage_[index]) continue;
                 coverage_[index] = value;
                 float a = value / 255.0f * opacity;
-                if (onMask_) {
+                if (options_.kind == StrokeKind::Heal) {
+                    // 拖动时只显示暗色预览，松手后再修复。
+                    const uint8_t* o = original->at(px, py);
+                    uint8_t* out = image_->at(px, py);
+                    float wash = a * 0.45f;
+                    for (int k = 0; k < 3; ++k) out[k] = uint8_t(std::lround(o[k] * (1 - wash)));
+                    out[3] = o[3];
+                } else if (options_.kind == StrokeKind::Clone) {
+                    // 从偏移处取像素（预乘、双线性），正常混合叠上去。
+                    double sx = dx + options_.cloneOffsetX, sy = dy + options_.cloneOffsetY;
+                    float src[4];
+                    if (options_.cloneSource) {
+                        sampleImage(*options_.cloneSource, sx - 0.5, sy - 0.5, src);
+                    } else {
+                        double lx, ly;
+                        docToPixel_.apply(sx, sy, lx, ly);
+                        sampleImage(*original, lx - 0.5, ly - 0.5, src);
+                    }
+                    const uint8_t* o = original->at(px, py);
+                    uint8_t* out = image_->at(px, py);
+                    float inv = 1 - src[3] / 255.0f * a;
+                    for (int k = 0; k < 4; ++k) out[k] = uint8_t(std::lround(std::clamp(src[k] * a + o[k] * inv, 0.0f, 255.0f)));
+                } else if (onMask_) {
                     float target = erase_ ? 0.0f : color_[0];
                     uint8_t o = originalMask->row(py)[px];
                     mask_->row(py)[px] = uint8_t(std::lround(o + (target - o) * a));
@@ -547,11 +603,111 @@ void BrushStroke::apply(double ax, double ay, double bx, double by) {
     if (mask_) mask_->touch();
 }
 
+bool BrushStroke::finish() {
+    if (!valid_ || options_.kind != StrokeKind::Heal || !image_) return true;
+    // 涂过的范围，再向外留出修复内核搜索补丁的空间（约三个斑点宽）。
+    long edges[4] = {0, 0, 0, 0};
+    heal_coverage_bounds(coverage_.data(), size_t(width_), size_t(height_), size_t(width_), edges);
+    if (edges[2] <= edges[0] || edges[3] <= edges[1]) { std::copy(originalImage_->pixels.begin(), originalImage_->pixels.end(), image_->pixels.begin()); image_->touch(); return true; }
+    double reach = (std::max(edges[2] - edges[0], edges[3] - edges[1]) + 32) * 3.2;
+    int x0 = std::max(0, int(edges[0] - reach)), y0 = std::max(0, int(edges[1] - reach));
+    int x1 = std::min(width_, int(edges[2] + reach)), y1 = std::min(height_, int(edges[3] + reach));
+    int w = x1 - x0, h = y1 - y0;
+    std::vector<uint8_t> rgba(size_t(w) * size_t(h) * 4), gray(size_t(w) * size_t(h));
+    for (int y = 0; y < h; ++y) {
+        std::copy(originalImage_->row(y0 + y) + size_t(x0) * 4, originalImage_->row(y0 + y) + size_t(x1) * 4, rgba.begin() + std::ptrdiff_t(size_t(y) * size_t(w) * 4));
+        std::copy(coverage_.begin() + std::ptrdiff_t(size_t(y0 + y) * size_t(width_) + size_t(x0)),
+                  coverage_.begin() + std::ptrdiff_t(size_t(y0 + y) * size_t(width_) + size_t(x1)), gray.begin() + std::ptrdiff_t(size_t(y) * size_t(w)));
+    }
+    // 先把整张恢复成原像素（去掉预览），再写回修复好的区域。
+    std::copy(originalImage_->pixels.begin(), originalImage_->pixels.end(), image_->pixels.begin());
+    int status = spot_heal(rgba.data(), gray.data(), size_t(w), size_t(h), size_t(w) * 4, float(std::clamp(brush_.opacity, 0.0, 1.0)),
+                           std::clamp(options_.healMode, 0, 2), options_.seed);
+    if (status != 0) { image_->touch(); return false; }
+    for (int y = 0; y < h; ++y) {
+        std::copy(rgba.begin() + std::ptrdiff_t(size_t(y) * size_t(w) * 4), rgba.begin() + std::ptrdiff_t(size_t(y + 1) * size_t(w) * 4),
+                  image_->row(y0 + y) + size_t(x0) * 4);
+    }
+    image_->touch();
+    return true;
+}
+
 bool paintStroke(Document& doc, const std::string& layerID, const std::vector<StrokePoint>& points,
                  const BrushSettings& brush, const uint8_t color[4], bool erase, bool onMask) {
     BrushStroke stroke(doc, layerID, brush, color, erase, onMask);
     if (!stroke.isValid()) return false;
     for (const auto& p : points) stroke.addPoint(p.x, p.y);
+    return stroke.finish();
+}
+
+bool drawGradient(Document& doc, const std::string& layerID, double ax, double ay, double bx, double by,
+                  const uint8_t from[4], const uint8_t to[4], const GradientSettings& settings, bool onMask,
+                  ImageRef originalImage, MaskRef originalMask) {
+    Layer* layer = doc.find(layerID);
+    if (!layer) return false;
+    double vx = bx - ax, vy = by - ay, length2 = vx * vx + vy * vy;
+    if (length2 < 0.25) return false;
+    double length = std::sqrt(length2);
+    float opacity = float(std::clamp(settings.opacity, 0.0, 1.0));
+    auto t = [&](double dx, double dy) {
+        double v = settings.radial ? std::hypot(dx - ax, dy - ay) / length : ((dx - ax) * vx + (dy - ay) * vy) / length2;
+        return float(std::clamp(v, 0.0, 1.0));
+    };
+    if (onMask) {
+        if (!layer->mask) return false;
+        int w, h;
+        maskSize(*layer, w, h);
+        MaskRef base = originalMask ? originalMask : layer->mask;
+        GrayImage start = base->uniformValue() >= 0 && (base->width != w || base->height != h) ? GrayImage(w, h, uint8_t(base->uniformValue())) : *base;
+        w = start.width; h = start.height;
+        const LayerTransform& placement = (layer->maskPlacement && !layer->maskLinked) ? *layer->maskPlacement : layer->transform;
+        Affine toDoc = Affine::scale(1.0 / w, 1.0 / h).then(placement.unitToDocument());
+        std::shared_ptr<GrayImage> selection;
+        if (doc.selection) selection = std::make_shared<GrayImage>(selectionInLayerGrid(placement, w, h, *doc.selection));
+        auto out = std::make_shared<GrayImage>(start);
+        parallelRanges(h, [&](int begin, int end) {
+            for (int y = begin; y < end; ++y) for (int x = 0; x < w; ++x) {
+                double dx, dy;
+                toDoc.apply(x + 0.5, y + 0.5, dx, dy);
+                float k = t(dx, dy);
+                float value = from[0] + (to[0] - from[0]) * k;
+                float alpha = (from[3] + (to[3] - from[3]) * k) / 255.0f * opacity;
+                if (selection) alpha *= selection->row(y)[x] / 255.0f;
+                uint8_t& o = out->row(y)[x];
+                o = uint8_t(std::lround(o + (value - o) * alpha));
+            }
+        });
+        out->touch();
+        layer->mask = out;
+        return true;
+    }
+    if (layer->isGroup || layer->adjustment) return false;
+    ImageRef base = originalImage ? originalImage : layer->image;
+    auto out = base ? std::make_shared<Image>(*base) : std::make_shared<Image>(
+        std::clamp(int(std::lround(layer->transform.width)), 1, kMaxSide), std::clamp(int(std::lround(layer->transform.height)), 1, kMaxSide));
+    int w = out->width, h = out->height;
+    Affine toDoc = Affine::scale(1.0 / w, 1.0 / h).then(layer->transform.unitToDocument());
+    std::shared_ptr<GrayImage> selection;
+    if (doc.selection) selection = std::make_shared<GrayImage>(selectionInLayerGrid(layer->transform, w, h, *doc.selection));
+    parallelRanges(h, [&](int begin, int end) {
+        for (int y = begin; y < end; ++y) for (int x = 0; x < w; ++x) {
+            double dx, dy;
+            toDoc.apply(x + 0.5, y + 0.5, dx, dy);
+            float k = t(dx, dy);
+            float a = (from[3] + (to[3] - from[3]) * k) / 255.0f * opacity;
+            if (selection) a *= selection->row(y)[x] / 255.0f;
+            if (a <= 0) continue;
+            uint8_t* p = out->at(x, y);
+            for (int c = 0; c < 3; ++c) {
+                float color = from[c] + (to[c] - from[c]) * k;
+                p[c] = uint8_t(std::lround(std::clamp(color * a + p[c] * (1 - a), 0.0f, 255.0f)));
+            }
+            p[3] = uint8_t(std::lround(std::clamp(255 * a + p[3] * (1 - a), 0.0f, 255.0f)));
+        }
+    });
+    out->touch();
+    layer->image = out;
+    layer->dropVectorMetadata();
     return true;
 }
 

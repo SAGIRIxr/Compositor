@@ -163,6 +163,36 @@ int main(int argc, char** argv) {
     EXPECT(session->doc().selection && session->doc().selection->row(20)[20] == 255 && session->doc().selection->row(200)[200] == 0);
     action(window, QStringLiteral("deselect"))->trigger();
 
+    // 渐变：在新图层上从左到右拖，左边是前景色（黑），右边是背景色（白）。
+    action(window, QStringLiteral("newLayer"))->trigger();
+    std::string gradientLayer = session->doc().activeLayerID;
+    action(window, QStringLiteral("tool_G"))->trigger();
+    drag(canvas, canvas->toWidget(QPointF(20, 150)).toPoint(), canvas->toWidget(QPointF(380, 150)).toPoint());
+    {
+        const Layer* g = session->doc().find(gradientLayer);
+        EXPECT(g->image && g->image->at(5, 150)[0] < 10 && g->image->at(395, 150)[0] > 245 && g->image->at(200, 150)[3] == 255);
+        action(window, QStringLiteral("undo"))->trigger();
+        EXPECT(!session->doc().find(gradientLayer)->image);
+        action(window, QStringLiteral("redo"))->trigger();
+    }
+    // 仿制：Alt 点击右边白色处取样，在左边黑色处涂抹，变白。
+    action(window, QStringLiteral("tool_S"))->trigger();
+    QTest::mouseClick(canvas, Qt::LeftButton, Qt::AltModifier, canvas->toWidget(QPointF(380, 150)).toPoint());
+    drag(canvas, canvas->toWidget(QPointF(30, 100)).toPoint(), canvas->toWidget(QPointF(30, 120)).toPoint());
+    EXPECT(session->doc().find(gradientLayer)->image->at(30, 110)[0] > 200);
+    // 污点修复：在渐变中间点一个黑点再修掉，结果接近周围。
+    {
+        Document& d = session->doc();
+        auto pixels = std::make_shared<Image>(*d.find(gradientLayer)->image);
+        for (int y = 198; y < 202; ++y) for (int x = 198; x < 202; ++x) { uint8_t* p = pixels->at(x, y); p[0] = p[1] = p[2] = 0; }
+        d.find(gradientLayer)->image = pixels;
+    }
+    int expected = session->doc().find(gradientLayer)->image->at(200, 190)[0];
+    action(window, QStringLiteral("tool_J"))->trigger();
+    drag(canvas, canvas->toWidget(QPointF(199, 200)).toPoint(), canvas->toWidget(QPointF(201, 200)).toPoint());
+    EXPECT(std::abs(session->doc().find(gradientLayer)->image->at(200, 200)[0] - expected) < 40);
+    action(window, QStringLiteral("delete"))->trigger();
+
     // 反相调整层（无参数，不弹编辑框）。
     action(window, QStringLiteral("adjust_Invert"))->trigger();
     EXPECT(session->doc().layers.size() == 3);

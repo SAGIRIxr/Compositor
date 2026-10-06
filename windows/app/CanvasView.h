@@ -57,7 +57,7 @@ protected:
     void leaveEvent(QEvent*) override;
 
 private:
-    enum class DragMode { None, Pan, Paint, Move, Resize, Rotate, Marquee, Lasso };
+    enum class DragMode { None, Pan, Paint, Move, Resize, Rotate, Marquee, Lasso, Gradient };
     void invalidate();
     void renderAll();
     void renderRegion(const QRectF& documentRect);
@@ -97,6 +97,13 @@ private:
     std::optional<QPointF> lastPaintPoint_;
     QPointF hover_ = QPointF(-1, -1);
     QPixmap checker_;
+    // 渐变拖动
+    bool gradientStarted_ = false;
+    QPointF gradientEnd_;
+    comp::ImageRef gradientImage_;
+    comp::MaskRef gradientMask_;
+    bool gradientOnMask_ = false;
+    void updateGradient(QPointF documentPoint, Qt::KeyboardModifiers modifiers);
     // 选区工具的进行状态
     comp::SelectionMode selectMode_ = comp::SelectionMode::Replace;
     Qt::KeyboardModifiers pressModifiers_;

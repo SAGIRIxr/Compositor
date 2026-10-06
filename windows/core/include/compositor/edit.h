@@ -56,6 +56,20 @@ struct BrushSettings {
 };
 struct StrokePoint { double x, y; };
 
+// 笔触的种类。
+enum class StrokeKind { Paint, Erase, Clone, Heal };
+
+struct StrokeOptions {
+    StrokeKind kind = StrokeKind::Paint;
+    // 仿制图章：从“笔下的文档位置 + 偏移”取像素。cloneSource 为文档尺寸的图像时从它取（对所有图层取样），
+    // 为空时从图层自己的原像素取。
+    double cloneOffsetX = 0, cloneOffsetY = 0;
+    std::shared_ptr<const Image> cloneSource;
+    // 污点修复：0 内容识别，1 创建纹理，2 近似匹配（HealPixels.c 的 mode）。
+    int healMode = 0;
+    uint32_t seed = 0;
+};
+
 // 一笔进行中的笔触：开始时记住原像素，之后每加一个点只重算新线段覆盖到的区域。
 // 文档有选区时，笔触只作用在选区内（按覆盖度）。
 // 同一笔内的覆盖取最大值，所以笔触自身重叠处不会越描越深（与 Photoshop 的不透明度一致）。
@@ -63,13 +77,20 @@ class BrushStroke {
 public:
     BrushStroke(Document& doc, const std::string& layerID, const BrushSettings& brush,
                 const uint8_t color[4], bool erase, bool onMask);
+    // 仿制图章与污点修复只作用在像素上（不能画在蒙版上）。
+    BrushStroke(Document& doc, const std::string& layerID, const BrushSettings& brush,
+                const uint8_t color[4], const StrokeOptions& options, bool onMask);
     bool isValid() const { return valid_; }
     void addPoint(double x, double y);
+    // 结束这一笔。污点修复在这里才真正计算（拖动时只显示暗色预览）。返回 false 表示修复失败（内存不足）。
+    bool finish();
     // 被修改过的文档区域（文档像素，外接框）；没有修改时宽度为 0。
     void dirtyRect(double& x, double& y, double& w, double& h) const;
 
 private:
     void apply(double x0, double y0, double x1, double y1);
+    void init(Document& doc, const std::string& layerID, bool onMask);
+    StrokeOptions options_;
     std::string layerID_;
     BrushSettings brush_;
     uint8_t color_[4];
@@ -91,6 +112,17 @@ private:
 // 返回 false 表示该图层不能画（文件夹、调整层）。
 bool paintStroke(Document& doc, const std::string& layerID, const std::vector<StrokePoint>& points,
                  const BrushSettings& brush, const uint8_t color[4], bool erase, bool onMask);
+
+// 渐变：从 (x0, y0) 到 (x1, y1)（文档坐标），线性或以起点为中心的径向。
+// from/to 是直通 RGBA；画在图层像素上用正常混合叠加，画在蒙版上用 from/to 的红色通道作灰度。
+// 有选区时只作用在选区内。original 为 nullptr 时从图层当前像素开始（拖动预览时传入拖动开始时的像素）。
+struct GradientSettings {
+    bool radial = false;
+    double opacity = 1;
+};
+bool drawGradient(Document& doc, const std::string& layerID, double x0, double y0, double x1, double y1,
+                  const uint8_t from[4], const uint8_t to[4], const GradientSettings& settings, bool onMask,
+                  ImageRef originalImage = nullptr, MaskRef originalMask = nullptr);
 
 // 用颜色填充图层（整个图层范围）。
 bool fillLayer(Document& doc, const std::string& layerID, const uint8_t color[4]);

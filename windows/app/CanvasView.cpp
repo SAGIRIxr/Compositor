@@ -8,6 +8,7 @@
 #include <QWheelEvent>
 #include <cmath>
 #include <iterator>
+#include <cstdlib>
 
 using namespace comp;
 
@@ -207,7 +208,30 @@ void CanvasView::paintEvent(QPaintEvent*) {
     }
     // 画笔光标：笔刷大小的圆。
     Tool tool = effectiveTool();
-    if ((tool == Tool::Brush || tool == Tool::Eraser) && hover_.x() >= 0) {
+    if (tool == Tool::Clone && tools_->cloneSource) {
+        // 仿制取样点的十字：对齐模式下跟着笔走。
+        QPointF sample = *tools_->cloneSource;
+        if (hover_.x() >= 0 && tools_->cloneAligned && tools_->cloneOffset) sample = toDocument(hover_) + *tools_->cloneOffset;
+        QPointF c = toWidget(sample);
+        painter.setRenderHint(QPainter::Antialiasing);
+        for (QColor color : {QColor(0, 0, 0, 180), QColor(255, 255, 255, 220)}) {
+            painter.setPen(QPen(color, color.red() ? 1 : 3));
+            painter.drawLine(c - QPointF(8, 0), c + QPointF(8, 0));
+            painter.drawLine(c - QPointF(0, 8), c + QPointF(0, 8));
+        }
+    }
+    if (drag_ == DragMode::Gradient) {
+        painter.setRenderHint(QPainter::Antialiasing);
+        QPointF a = toWidget(dragStartDocument_), b = toWidget(gradientEnd_);
+        painter.setPen(QPen(QColor(0, 0, 0, 160), 3));
+        painter.drawLine(a, b);
+        painter.setPen(QPen(Qt::white, 1));
+        painter.drawLine(a, b);
+        painter.setBrush(Qt::white);
+        painter.drawEllipse(a, 3, 3);
+        painter.drawEllipse(b, 3, 3);
+    }
+    if ((tool == Tool::Brush || tool == Tool::Eraser || tool == Tool::Heal || tool == Tool::Clone) && hover_.x() >= 0) {
         painter.setRenderHint(QPainter::Antialiasing);
         double r = tools_->brush.size / 2 * zoom_;
         painter.setBrush(Qt::NoBrush);
@@ -259,7 +283,10 @@ void CanvasView::updateCursor(QPointF p) {
     switch (effectiveTool()) {
     case Tool::Hand: setCursor(drag_ == DragMode::Pan ? Qt::ClosedHandCursor : Qt::OpenHandCursor); return;
     case Tool::Brush:
-    case Tool::Eraser: setCursor(Qt::CrossCursor); return;
+    case Tool::Eraser:
+    case Tool::Heal:
+    case Tool::Clone:
+    case Tool::Gradient: setCursor(Qt::CrossCursor); return;
     case Tool::Eyedropper:
     case Tool::Marquee:
     case Tool::Lasso:
@@ -295,18 +322,44 @@ void CanvasView::beginPaint(QPointF d, bool shift) {
     Document& doc = session_->doc();
     Layer* layer = doc.find(doc.activeLayerID);
     if (!layer) { emit statusMessage(QStringLiteral("请先选择一个图层。")); return; }
-    bool onMask = tools_->paintOnMask && layer->mask;
+    Tool tool = effectiveTool();
+    bool pixelsOnly = tool == Tool::Heal || tool == Tool::Clone;
+    bool onMask = !pixelsOnly && tools_->paintOnMask && layer->mask;
     if (!onMask && (layer->isGroup || layer->isAdjustment())) {
         emit statusMessage(QStringLiteral("文件夹和调整层没有像素可画，请先给它添加蒙版并切换到“绘制到蒙版”。"));
         return;
     }
+    if (pixelsOnly && !layer->image) { emit statusMessage(QStringLiteral("这个图层还没有像素可以修复或仿制。")); return; }
     if (!doc.isEffectivelyVisible(*layer)) { emit statusMessage(QStringLiteral("图层已隐藏，无法在上面绘画。")); return; }
-    bool erase = effectiveTool() == Tool::Eraser;
+    StrokeOptions options;
+    QString name = QStringLiteral("画笔");
+    switch (tool) {
+    case Tool::Eraser: options.kind = StrokeKind::Erase; name = QStringLiteral("橡皮擦"); break;
+    case Tool::Heal:
+        options.kind = StrokeKind::Heal;
+        options.healMode = tools_->healMode;
+        options.seed = uint32_t(std::rand());
+        name = QStringLiteral("污点修复");
+        break;
+    case Tool::Clone: {
+        if (!tools_->cloneSource) { emit statusMessage(QStringLiteral("先按住 Alt 点击图像，设置仿制的取样点。")); return; }
+        options.kind = StrokeKind::Clone;
+        QPointF offset = (tools_->cloneAligned && tools_->cloneOffset) ? *tools_->cloneOffset
+            : QPointF(std::round(tools_->cloneSource->x() - d.x()), std::round(tools_->cloneSource->y() - d.y()));
+        if (tools_->cloneAligned) tools_->cloneOffset = offset;
+        options.cloneOffsetX = offset.x();
+        options.cloneOffsetY = offset.y();
+        if (tools_->cloneAllLayers) options.cloneSource = std::make_shared<Image>(flatten(doc));
+        name = QStringLiteral("仿制图章");
+        break;
+    }
+    default: break;
+    }
     QColor c = tools_->foreground;
     uint8_t color[4] = {uint8_t(c.red()), uint8_t(c.green()), uint8_t(c.blue()), 255};
     if (onMask) color[0] = color[1] = color[2] = uint8_t(qGray(c.rgb()));
-    session_->checkpoint(erase ? QStringLiteral("橡皮擦") : QStringLiteral("画笔"));
-    stroke_ = std::make_unique<BrushStroke>(doc, layer->id, tools_->brush, color, erase, onMask);
+    session_->checkpoint(name);
+    stroke_ = std::make_unique<BrushStroke>(doc, layer->id, tools_->brush, color, options, onMask);
     if (!stroke_->isValid()) { stroke_.reset(); return; }
     drag_ = DragMode::Paint;
     // Shift 点击：从上一笔的终点画直线。
@@ -316,6 +369,40 @@ void CanvasView::beginPaint(QPointF d, bool shift) {
     double x, y, w, h;
     stroke_->dirtyRect(x, y, w, h);
     session_->notifyPixels(QRectF(x, y, w, h));
+}
+
+void CanvasView::updateGradient(QPointF d, Qt::KeyboardModifiers modifiers) {
+    QPointF start = dragStartDocument_;
+    if (modifiers & Qt::ShiftModifier) {
+        // 约束到 45° 的倍数。
+        double angle = std::atan2(d.y() - start.y(), d.x() - start.x());
+        double snapped = std::round(angle / (kPi / 4)) * (kPi / 4);
+        double length = QLineF(start, d).length();
+        d = start + QPointF(std::cos(snapped) * length, std::sin(snapped) * length);
+    }
+    gradientEnd_ = d;
+    if (QLineF(start, d).length() < 0.5) return;
+    Document& doc = session_->doc();
+    if (!gradientStarted_) {
+        session_->checkpoint(QStringLiteral("渐变"));
+        gradientStarted_ = true;
+    }
+    QColor fg = tools_->foreground, bg = tools_->background;
+    uint8_t from[4] = {uint8_t(fg.red()), uint8_t(fg.green()), uint8_t(fg.blue()), 255};
+    uint8_t to[4] = {uint8_t(bg.red()), uint8_t(bg.green()), uint8_t(bg.blue()), 255};
+    if (tools_->gradientToTransparent) { std::copy(from, from + 3, to); to[3] = 0; }
+    if (gradientOnMask_) {
+        from[0] = uint8_t(qGray(fg.rgb()));
+        if (!tools_->gradientToTransparent) to[0] = uint8_t(qGray(bg.rgb()));
+        else to[0] = from[0];
+    }
+    if (tools_->gradientReversed) for (int k = 0; k < 4; ++k) std::swap(from[k], to[k]);
+    GradientSettings settings;
+    settings.radial = tools_->gradientRadial;
+    settings.opacity = tools_->gradientOpacity;
+    drawGradient(doc, doc.activeLayerID, start.x(), start.y(), d.x(), d.y(), from, to, settings, gradientOnMask_,
+                 gradientImage_, gradientMask_);
+    session_->notifyChanged(false);
 }
 
 void CanvasView::mousePressEvent(QMouseEvent* event) {
@@ -341,10 +428,41 @@ void CanvasView::mousePressEvent(QMouseEvent* event) {
         if (sampleColor(d, color)) emit colorPicked(color, event->modifiers() & Qt::AltModifier);
         return;
     }
-    case Tool::Brush:
-    case Tool::Eraser:
+    case Tool::Clone:
+        if (event->modifiers() & Qt::AltModifier) {
+            tools_->cloneSource = d;
+            tools_->cloneOffset.reset();
+            emit statusMessage(QStringLiteral("仿制取样点：%1, %2").arg(int(d.x())).arg(int(d.y())));
+            update();
+            return;
+        }
         beginPaint(d, event->modifiers() & Qt::ShiftModifier);
         return;
+    case Tool::Brush:
+    case Tool::Eraser:
+    case Tool::Heal:
+        beginPaint(d, event->modifiers() & Qt::ShiftModifier);
+        return;
+    case Tool::Gradient: {
+        const Layer* layer = doc.find(doc.activeLayerID);
+        if (!layer) { emit statusMessage(QStringLiteral("请先选择一个图层。")); return; }
+        gradientOnMask_ = tools_->paintOnMask && layer->mask;
+        if (!gradientOnMask_ && (layer->isGroup || layer->isAdjustment())) {
+            emit statusMessage(QStringLiteral("渐变要画在像素图层上，或者给它添加蒙版后画在蒙版上。"));
+            return;
+        }
+        gradientImage_ = layer->image;
+        if (!gradientImage_ && !gradientOnMask_) {
+            // 空白图层：每次都从同一张透明底图重画，不在上一次的预览上叠加。
+            gradientImage_ = std::make_shared<Image>(std::clamp(int(std::lround(layer->transform.width)), 1, kMaxSide),
+                                                     std::clamp(int(std::lround(layer->transform.height)), 1, kMaxSide));
+        }
+        gradientMask_ = layer->mask;
+        gradientStarted_ = false;
+        gradientEnd_ = d;
+        drag_ = DragMode::Gradient;
+        return;
+    }
     case Tool::Move: {
         const Layer* layer = transformTarget();
         if (!layer) { emit statusMessage(QStringLiteral("请选择要移动的图层。")); return; }
@@ -504,6 +622,10 @@ void CanvasView::mouseMoveEvent(QMouseEvent* event) {
     case DragMode::Marquee:
         update();
         break;
+    case DragMode::Gradient:
+        updateGradient(d, event->modifiers());
+        update();
+        break;
     case DragMode::Lasso:
         if (lassoPoints_.empty() || QLineF(toWidget(lassoPoints_.back()), p).length() >= 1.5) lassoPoints_.push_back(d);
         update();
@@ -511,7 +633,8 @@ void CanvasView::mouseMoveEvent(QMouseEvent* event) {
     case DragMode::None:
         if (polygonActive_) update();
         if (effectiveTool() == Tool::Move) updateCursor(p);
-        if (effectiveTool() == Tool::Brush || effectiveTool() == Tool::Eraser) {
+        if (effectiveTool() == Tool::Clone && tools_->cloneSource) update();
+        else if (effectiveTool() == Tool::Brush || effectiveTool() == Tool::Eraser || effectiveTool() == Tool::Heal) {
             double r = tools_->brush.size / 2 * zoom_ + 4;
             update(QRectF(oldHover.x() - r, oldHover.y() - r, 2 * r, 2 * r).toAlignedRect());
             update(QRectF(p.x() - r, p.y() - r, 2 * r, 2 * r).toAlignedRect());
@@ -550,7 +673,20 @@ void CanvasView::mouseReleaseEvent(QMouseEvent* event) {
         update();
         return;
     }
+    if (drag_ == DragMode::Gradient) {
+        drag_ = DragMode::None;
+        gradientImage_.reset();
+        gradientMask_.reset();
+        update();
+        return;
+    }
     if (drag_ == DragMode::Paint) {
+        if (stroke_) {
+            QApplication::setOverrideCursor(Qt::WaitCursor);
+            bool ok = stroke_->finish();
+            QApplication::restoreOverrideCursor();
+            if (!ok) emit statusMessage(QStringLiteral("修复失败：内存不足。"));
+        }
         stroke_.reset();
         session_->notifyChanged(false); // 刷新缩略图
     }
